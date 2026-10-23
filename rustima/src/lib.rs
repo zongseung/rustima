@@ -939,6 +939,9 @@ fn sarimax_batch_fit<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyList>> {
+    if let Some(method) = method.filter(|name| name.starts_with("basin-")) {
+        optimizer::validate_method(method).map_err(to_pyerr)?;
+    }
     let (series, exog_vecs, config) = prepare_batch_request(
         &series_list, order, seasonal, &exog_list,
         &ModelFlags { enforce_stationarity, enforce_invertibility, concentrate_scale, simple_differencing },
@@ -1001,6 +1004,9 @@ fn sarimax_grid_search<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyList>> {
+    if let Some(method) = method.filter(|name| name.starts_with("basin-")) {
+        optimizer::validate_method(method).map_err(to_pyerr)?;
+    }
     if order_list.len() != seasonal_list.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "order_list length ({}) must match seasonal_list length ({})",

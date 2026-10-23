@@ -1,8 +1,8 @@
-//! SARIMAX parameter optimization via L-BFGS with Nelder-Mead fallback.
+//! SARIMAX parameter optimization with optional Basin L-BFGS-B support.
 //!
 //! This module provides:
 //! - Parameter space transformations (constrained ↔ unconstrained)
-//! - Negative log-likelihood objective function for argmin
+//! - Negative log-likelihood objectives shared by optimization backends
 //! - `fit()` function: the main entry point for model fitting
 
 use argmin::core::{Executor, State};
@@ -14,31 +14,39 @@ use nalgebra::DMatrix;
 
 use crate::css;
 use crate::error::{Result, SarimaxError};
-use crate::pipeline;
 use crate::initialization::KalmanInit;
 use crate::kalman::kalman_loglike;
 use crate::params::SarimaxParams;
+use crate::pipeline;
 use crate::start_params::compute_start_params;
 use crate::state_space::StateSpace;
 use crate::types::{FitResult, SarimaxConfig};
 
-mod transforms;
+#[cfg(test)]
+mod basin_tests;
+mod lbfgsb;
+mod multistart;
 mod objective;
 mod runners;
-mod trust_region;
-mod multistart;
 #[cfg(test)]
 mod tests;
+mod transforms;
+mod trust_region;
 
-pub use transforms::{transform_params, untransform_params};
-use transforms::expected_param_len;
-use objective::{CssObjective, SarimaxObjective};
-use runners::{compute_bounds, run_lbfgsb, run_nelder_mead};
+use lbfgsb::{parse_method, Backend};
 use multistart::{
     compute_n_restarts, fit_bfgs_single, fit_lbfgs_argmin, fit_lbfgsb_adaptive_restart,
     fit_lbfgsb_hybrid, fit_lbfgsb_multi, fit_lbfgsb_single,
 };
+use objective::{CssObjective, SarimaxObjective};
+use runners::{compute_bounds, run_lbfgsb, run_nelder_mead};
+use transforms::expected_param_len;
+pub use transforms::{transform_params, untransform_params};
 use trust_region::{fit_profile_trust_region, fit_trust_region_single};
+
+pub(crate) fn validate_method(method: &str) -> Result<()> {
+    parse_method(method).map(|_| ())
+}
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -262,6 +270,7 @@ fn run_sd_warm_start(
     endog: &[f64],
     config: &SarimaxConfig,
     exog: Option<&[Vec<f64>]>,
+    backend: Backend,
 ) -> Option<Vec<f64>> {
     let mut sd_config = config.clone();
     sd_config.simple_differencing = true;
@@ -275,7 +284,8 @@ fn run_sd_warm_start(
     // CSS pre-optimization on SD path
     let n_arma = sd_config.order.p + sd_config.order.q + sd_config.order.pp + sd_config.order.qq;
     if n_arma >= 1 {
-        if let Some(css_p) = run_css_optimization(endog, &sd_config, &sd_start, 200, exog) {
+        if let Some(css_p) = run_css_optimization(endog, &sd_config, &sd_start, 200, exog, backend)
+        {
             let css_ll = eval_kf_loglike_constrained(&sd_endog, &sd_config, &css_p, sd_exog);
             let orig_ll = eval_kf_loglike_constrained(&sd_endog, &sd_config, &sd_start, sd_exog);
             if css_ll > orig_ll {
@@ -294,7 +304,8 @@ fn run_sd_warm_start(
         ss_cache: RefCell::new(None),
     };
 
-    let (best_unc, _, _, _, _) = fit_lbfgsb_single(&sd_obj, sd_unc, &sd_config, 200).ok()?;
+    let (best_unc, _, _, _, _) =
+        fit_lbfgsb_single(&sd_obj, sd_unc, &sd_config, 200, backend).ok()?;
     transform_params(&best_unc, &sd_config).ok()
 }
 
@@ -442,6 +453,7 @@ fn run_css_optimization(
     constrained_start: &[f64],
     maxiter: u64,
     exog: Option<&[Vec<f64>]>,
+    backend: Backend,
 ) -> Option<Vec<f64>> {
     let unconstrained_start = untransform_params(constrained_start, config).ok()?;
     let n = unconstrained_start.len();
@@ -450,7 +462,9 @@ fn run_css_optimization(
     }
 
     // 1st: L-BFGS-B on CSS (R-style gradient-based optimization)
-    if let Some(result) = run_lbfgsb_css(endog, config, &unconstrained_start, maxiter, exog) {
+    if let Some(result) =
+        run_lbfgsb_css(endog, config, &unconstrained_start, maxiter, exog, backend)
+    {
         if let Ok(constrained) = transform_params(&result, config) {
             return Some(constrained);
         }
@@ -461,93 +475,67 @@ fn run_css_optimization(
 }
 
 /// L-BFGS-B optimization on CSS objective with finite-difference gradient.
+struct CssLbfgsbObjective<'a> {
+    endog: &'a [f64],
+    config: &'a SarimaxConfig,
+    exog: Option<&'a [Vec<f64>]>,
+}
+
+impl lbfgsb::Objective for CssLbfgsbObjective<'_> {
+    fn cost(&self, x: &[f64]) -> f64 {
+        transform_params(x, self.config)
+            .ok()
+            .and_then(|p| SarimaxParams::from_flat(&p, self.config).ok())
+            .map(|p| -css::css_loglike_with_exog(self.endog, self.config, &p, self.exog))
+            .filter(|c| c.is_finite())
+            .unwrap_or(lbfgsb::INVALID_COST)
+    }
+
+    fn evaluate(&self, x: &[f64], gradient: &mut [f64]) -> f64 {
+        let value = self.cost(x);
+        if value >= f64::MAX / 4.0 {
+            gradient.fill(0.0);
+            return lbfgsb::INVALID_COST;
+        }
+        let mut trial = x.to_vec();
+        for i in 0..x.len() {
+            trial[i] = x[i] + 1e-7;
+            let plus = self.cost(&trial);
+            trial[i] = x[i] - 1e-7;
+            let minus = self.cost(&trial);
+            trial[i] = x[i];
+            gradient[i] = (plus - minus) / 2e-7;
+            if !gradient[i].is_finite() {
+                gradient[i] = 0.0;
+            }
+        }
+        value
+    }
+}
+
 fn run_lbfgsb_css(
     endog: &[f64],
     config: &SarimaxConfig,
     unconstrained_start: &[f64],
     maxiter: u64,
     exog: Option<&[Vec<f64>]>,
+    backend: Backend,
 ) -> Option<Vec<f64>> {
-    let n = unconstrained_start.len();
-    let endog_owned = endog.to_vec();
-    let config_owned = config.clone();
-    let exog_owned: Option<Vec<Vec<f64>>> = exog.map(|e| e.to_vec());
-    let eval_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let eval_count_inner = eval_count.clone();
-    let hit_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let hit_limit_inner = hit_limit.clone();
-
-    let css_eval = |unconstrained: &[f64]| -> f64 {
-        match transform_params(unconstrained, &config_owned) {
-            Ok(constrained) => match SarimaxParams::from_flat(&constrained, &config_owned) {
-                Ok(sparams) => {
-                    let ll = css::css_loglike_with_exog(
-                        &endog_owned, &config_owned, &sparams,
-                        exog_owned.as_deref(),
-                    );
-                    if ll.is_finite() { -ll } else { f64::MAX / 2.0 }
-                }
-                Err(_) => f64::MAX / 2.0,
-            },
-            Err(_) => f64::MAX / 2.0,
-        }
+    let objective = CssLbfgsbObjective {
+        endog,
+        config,
+        exog,
     };
-
-    let evaluate = move |x: &[f64], g: &mut [f64]| -> anyhow::Result<f64> {
-        let count = eval_count_inner.load(std::sync::atomic::Ordering::Relaxed);
-        if count >= maxiter {
-            hit_limit_inner.store(true, std::sync::atomic::Ordering::Relaxed);
-            for g_i in g.iter_mut() {
-                *g_i = 0.0;
-            }
-            return Ok(css_eval(x));
-        }
-        eval_count_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let cost = css_eval(x);
-        if !cost.is_finite() || cost >= f64::MAX / 4.0 {
-            for g_i in g.iter_mut() {
-                *g_i = 0.0;
-            }
-            return Ok(f64::MAX / 2.0);
-        }
-
-        // Central finite-difference gradient (eps=1e-7)
-        let eps = 1e-7;
-        let mut x_work = x.to_vec();
-        for i in 0..n {
-            let orig = x_work[i];
-            x_work[i] = orig + eps;
-            let f_fwd = css_eval(&x_work);
-            x_work[i] = orig - eps;
-            let f_bwd = css_eval(&x_work);
-            x_work[i] = orig;
-            g[i] = (f_fwd - f_bwd) / (2.0 * eps);
-            if !g[i].is_finite() {
-                g[i] = 0.0;
-            }
-        }
-        Ok(cost)
-    };
-
-    // Box bounds: [-10, 10] for all params (unconstrained space)
-    let bounds_vec: Vec<(Option<f64>, Option<f64>)> =
-        vec![(Some(-10.0), Some(10.0)); n];
-
-    let param = crate::lbfgsb_wrapper::LbfgsbParameter {
-        m: 10,
-        factr: 1e7,
-        pgtol: 1e-5,
-        iprint: -1,
-    };
-
-    let mut problem = crate::lbfgsb_wrapper::LbfgsbProblem::build(unconstrained_start.to_vec(), evaluate);
-    problem.set_bounds(bounds_vec);
-
-    let mut state = crate::lbfgsb_wrapper::LbfgsbState::new(problem, param);
-    state.minimize().ok()?;
-
-    Some(state.x().to_vec())
+    let bounds = vec![(Some(-10.0), Some(10.0)); unconstrained_start.len()];
+    lbfgsb::minimize(
+        backend,
+        &objective,
+        unconstrained_start.to_vec(),
+        bounds,
+        maxiter,
+    )
+    .ok()
+    .map(|(params, _, _, _)| params)
 }
 
 /// NM fallback for CSS optimization.
@@ -578,9 +566,7 @@ fn run_nm_css(
         simplex.push(vertex);
     }
 
-    let solver = NelderMead::new(simplex)
-        .with_sd_tolerance(1e-4)
-        .ok()?;
+    let solver = NelderMead::new(simplex).with_sd_tolerance(1e-4).ok()?;
 
     let result = Executor::new(obj, solver)
         .configure(
@@ -606,8 +592,9 @@ fn run_nm_css(
 /// * `config` — Model configuration (order, stationarity enforcement, etc.)
 /// * `start_params` — Optional initial parameter values (constrained space)
 /// * `method` — "lbfgsb" (default), "lbfgsb-multi", "trust-region",
-///   "profile-trust-region", "lbfgs", or "nelder-mead"
-/// * `maxiter` — Maximum iterations (default: 500)
+///   "profile-trust-region", "lbfgs", or "nelder-mead". With feature `basin`,
+///   prefix an L-BFGS-B strategy with "basin-" to select Basin.
+/// * `maxiter` — Maximum optimizer work units (default: 500)
 /// * `exog` — Optional exogenous variables, column-major: exog[j][t]
 pub fn fit(
     endog: &[f64],
@@ -618,23 +605,8 @@ pub fn fit(
     exog: Option<&[Vec<f64>]>,
 ) -> Result<FitResult> {
     let maxiter = maxiter.unwrap_or(500);
-    let method = method.unwrap_or("lbfgsb");
-
-    // --- Early validation (before any fast-path) ---
-    // (a) Method whitelist: reject unknown methods immediately.
-    const VALID_METHODS: &[&str] = &[
-        "lbfgsb", "lbfgsb-multi", "lbfgsb-adaptive", "lbfgsb-hybrid",
-        "lbfgsb-strict", "lbfgsb_single",
-        "lbfgs", "bfgs", "trust-region", "profile-trust-region",
-        "nelder-mead", "nm",
-    ];
-    if !VALID_METHODS.contains(&method) {
-        return Err(SarimaxError::OptimizationFailed(format!(
-            "unknown method: '{}'. Valid methods: {}",
-            method,
-            VALID_METHODS.join(", ")
-        )));
-    }
+    let requested_method = method.unwrap_or("lbfgsb");
+    let (method, backend) = parse_method(requested_method)?;
 
     // (b) start_params length: must match expected free param count if provided.
     if let Some(sp) = start_params {
@@ -642,7 +614,8 @@ pub fn fit(
         if sp.len() != expected {
             return Err(SarimaxError::InvalidInput(format!(
                 "start_params length mismatch: expected {}, got {}",
-                expected, sp.len()
+                expected,
+                sp.len()
             )));
         }
     }
@@ -669,7 +642,7 @@ pub fn fit(
             + config.order.qq
             + if config.concentrate_scale { 0 } else { 1 };
         if k_params == 0 {
-            return build_zero_iter_result(eff_endog, config, &[], eff_exog, method);
+            return build_zero_iter_result(eff_endog, config, &[], eff_exog, requested_method);
         }
     }
 
@@ -678,11 +651,24 @@ pub fn fit(
     let mut constrained_start = validate_and_get_start_params(endog, config, start_params, exog)?;
 
     // 2. Fast paths (AR-only, maxiter=0) — use eff_endog
-    if let Some(r) = try_ar_fast_path(eff_endog, config, &constrained_start, eff_exog, method, start_params.is_some())? {
+    if let Some(r) = try_ar_fast_path(
+        eff_endog,
+        config,
+        &constrained_start,
+        eff_exog,
+        method,
+        start_params.is_some(),
+    )? {
         return Ok(r);
     }
     if maxiter == 0 {
-        return build_zero_iter_result(eff_endog, config, &constrained_start, eff_exog, method);
+        return build_zero_iter_result(
+            eff_endog,
+            config,
+            &constrained_start,
+            eff_exog,
+            requested_method,
+        );
     }
 
     // 2.5. CSS-ML 2-stage pre-optimization (R-style):
@@ -703,14 +689,16 @@ pub fn fit(
     let skip_css_preopt = method == "trust-region";
     if start_params.is_none() && !skip_css_preopt {
         let n_arma = config.order.p + config.order.q + config.order.pp + config.order.qq;
-        let is_seasonal = config.order.s >= 2
-            && (config.order.pp > 0 || config.order.qq > 0);
+        let is_seasonal = config.order.s >= 2 && (config.order.pp > 0 || config.order.qq > 0);
         let benefit_from_css = n_arma >= 1 && (is_seasonal || n_arma >= 2);
         if benefit_from_css {
             // CSS optimization uses original endog (CSS applies differencing internally)
-            if let Some(css_params) = run_css_optimization(endog, config, &constrained_start, 300, exog) {
+            if let Some(css_params) =
+                run_css_optimization(endog, config, &constrained_start, 300, exog, backend)
+            {
                 // KF evaluation uses eff_endog (already differenced)
-                let css_kf_ll = eval_kf_loglike_constrained(eff_endog, config, &css_params, eff_exog);
+                let css_kf_ll =
+                    eval_kf_loglike_constrained(eff_endog, config, &css_params, eff_exog);
                 let orig_kf_ll =
                     eval_kf_loglike_constrained(eff_endog, config, &constrained_start, eff_exog);
                 let threshold = if is_seasonal { 0.0 } else { 2.0 };
@@ -729,7 +717,7 @@ pub fn fit(
     if start_params.is_none() && !config.simple_differencing && !skip_css_preopt {
         let k_states = config.order.k_states();
         if k_states >= 40 {
-            if let Some(sd_params) = run_sd_warm_start(endog, config, exog) {
+            if let Some(sd_params) = run_sd_warm_start(endog, config, exog, backend) {
                 let sd_ll = eval_kf_loglike_constrained(eff_endog, config, &sd_params, eff_exog);
                 let orig_ll =
                     eval_kf_loglike_constrained(eff_endog, config, &constrained_start, eff_exog);
@@ -760,58 +748,78 @@ pub fn fit(
         }
         "lbfgsb-strict" | "lbfgsb_single" => {
             let bounds = compute_bounds(config);
-            let (p, c, n, conv) = run_lbfgsb(&objective, unconstrained_start, bounds, maxiter)
-                .map_err(SarimaxError::OptimizationFailed)?;
+            let (p, c, n, conv) =
+                run_lbfgsb(&objective, unconstrained_start, bounds, maxiter, backend)
+                    .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?;
             (p, c, n, conv, "lbfgsb-strict".to_string())
         }
-        "lbfgsb" => fit_lbfgsb_single(&objective, unconstrained_start, config, maxiter)?,
+        "lbfgsb" => fit_lbfgsb_single(&objective, unconstrained_start, config, maxiter, backend)
+            .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
         "lbfgsb-multi" => fit_lbfgsb_multi(
             &objective,
             &unconstrained_start,
             config,
             maxiter,
             n_restarts,
-        )?,
+            backend,
+        )
+        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
         "lbfgsb-adaptive" => fit_lbfgsb_adaptive_restart(
             &objective,
             unconstrained_start,
             config,
             maxiter,
             n_restarts,
-        )?,
+            backend,
+        )
+        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
         "lbfgsb-hybrid" => fit_lbfgsb_hybrid(
             &objective,
             &unconstrained_start,
             config,
             maxiter,
             n_restarts,
+            backend,
+        )
+        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
+        "lbfgs" => fit_lbfgs_argmin(
+            &objective,
+            &unconstrained_start,
+            config,
+            maxiter,
+            n_restarts,
         )?,
-        "lbfgs" => {
-            fit_lbfgs_argmin(&objective, &unconstrained_start, config, maxiter, n_restarts)?
-        }
         "bfgs" => fit_bfgs_single(&objective, unconstrained_start, config, maxiter)?,
-        "trust-region" => fit_trust_region_single(&objective, unconstrained_start, config, maxiter)?,
-        "profile-trust-region" => {
-            fit_profile_trust_region(
-                &objective,
-                unconstrained_start,
-                config,
-                maxiter,
-                start_params.is_some(),
-            )?
+        "trust-region" => {
+            fit_trust_region_single(&objective, unconstrained_start, config, maxiter)?
         }
-        // Unreachable in practice: the VALID_METHODS whitelist above rejects
-        // unknown methods before dispatch. Kept as an error (not a panic) so a
-        // future whitelist/match drift degrades gracefully.
-        _ => {
-            return Err(SarimaxError::OptimizationFailed(format!(
-                "unknown method: '{}'. Valid methods: {}",
-                method,
-                VALID_METHODS.join(", ")
-            )));
+        "profile-trust-region" => fit_profile_trust_region(
+            &objective,
+            unconstrained_start,
+            config,
+            maxiter,
+            start_params.is_some(),
+        )?,
+        _ => unreachable!("validated optimization method"),
+    };
+    let used_method = if backend.is_basin() {
+        if used_method.starts_with("lbfgsb") {
+            format!("basin-{used_method}")
+        } else {
+            format!("{used_method} (from {requested_method})")
         }
+    } else {
+        used_method
     };
 
     // 5. Build result (n_obs = eff_endog.len() for correct AIC/BIC)
-    build_fit_result(eff_endog, config, &best_unconstrained, n_iter, converged, used_method, eff_exog)
+    build_fit_result(
+        eff_endog,
+        config,
+        &best_unconstrained,
+        n_iter,
+        converged,
+        used_method,
+        eff_exog,
+    )
 }

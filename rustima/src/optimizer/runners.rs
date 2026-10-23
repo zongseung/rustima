@@ -3,13 +3,13 @@
 use argmin::core::{Executor, State, TerminationReason};
 use argmin::solver::linesearch::MoreThuenteLineSearch;
 use argmin::solver::neldermead::NelderMead;
-use argmin::solver::quasinewton::{LBFGS, BFGS};
+use argmin::solver::quasinewton::{BFGS, LBFGS};
 
 use crate::error::SarimaxError;
 use crate::types::SarimaxConfig;
 
-use super::DIAG_PRECOND_SCALE;
 use super::objective::{ProfiledSarimaxObjective, SarimaxObjective};
+use super::DIAG_PRECOND_SCALE;
 
 // ---------------------------------------------------------------------------
 // L-BFGS optimization
@@ -81,7 +81,10 @@ pub(super) fn run_bfgs(
     let result = Executor::new(objective, solver)
         .configure(
             |state: argmin::core::IterState<Vec<f64>, Vec<f64>, (), Vec<Vec<f64>>, (), f64>| {
-                state.param(init_params).inv_hessian(init_hessian).max_iters(maxiter)
+                state
+                    .param(init_params)
+                    .inv_hessian(init_hessian)
+                    .max_iters(maxiter)
             },
         )
         .run()
@@ -105,11 +108,7 @@ pub(super) fn run_bfgs(
 ///
 /// `f` must return the objective value to differentiate (already sign-adjusted
 /// by the caller). Errors from `f` propagate.
-fn central_diff_grad<F>(
-    x: &[f64],
-    eps: f64,
-    mut f: F,
-) -> std::result::Result<Vec<f64>, String>
+fn central_diff_grad<F>(x: &[f64], eps: f64, mut f: F) -> std::result::Result<Vec<f64>, String>
 where
     F: FnMut(&[f64]) -> std::result::Result<f64, String>,
 {
@@ -300,106 +299,97 @@ pub(super) fn compute_bounds(config: &SarimaxConfig) -> Vec<(Option<f64>, Option
     bounds
 }
 
+struct KalmanObjective<'a>(&'a SarimaxObjective);
+
+impl super::lbfgsb::Objective for KalmanObjective<'_> {
+    fn cost(&self, x: &[f64]) -> f64 {
+        self.0
+            .eval_negloglike(x)
+            .ok()
+            .filter(|c| c.is_finite())
+            .unwrap_or(super::lbfgsb::INVALID_COST)
+    }
+
+    fn evaluate(&self, x: &[f64], gradient: &mut [f64]) -> f64 {
+        evaluate_with_fallback(
+            x,
+            gradient,
+            || self.0.eval_negloglike_with_gradient(x),
+            |point| self.0.eval_negloglike(point),
+        )
+    }
+}
+
+/// Keep both backends on the same analytical and numerical gradient paths.
+fn evaluate_with_fallback<A, C>(x: &[f64], gradient: &mut [f64], analytical: A, cost: C) -> f64
+where
+    A: FnOnce() -> Result<(f64, Vec<f64>), String>,
+    C: Fn(&[f64]) -> Result<f64, String>,
+{
+    if let Ok((value, g)) = analytical() {
+        if value.is_finite() && g.len() == gradient.len() && g.iter().all(|v| v.is_finite()) {
+            gradient.copy_from_slice(&g);
+            return value;
+        }
+    }
+    let value = match cost(x) {
+        Ok(c) if c.is_finite() => c,
+        _ => {
+            gradient.fill(0.0);
+            return super::lbfgsb::INVALID_COST;
+        }
+    };
+    let mut trial = x.to_vec();
+    for i in 0..x.len() {
+        let step = (1.0 + x[i].abs()) * 1e-7;
+        trial[i] = x[i] + step;
+        let plus = cost(&trial).ok().filter(|c| c.is_finite()).unwrap_or(value);
+        trial[i] = x[i];
+        gradient[i] = (plus - value) / step;
+        if !gradient[i].is_finite() {
+            gradient[i] = 0.0;
+        }
+    }
+    value
+}
+
 pub(super) fn run_lbfgsb(
     objective: &SarimaxObjective,
     init_params: Vec<f64>,
-    bounds_vec: Vec<(Option<f64>, Option<f64>)>,
+    bounds: Vec<(Option<f64>, Option<f64>)>,
     maxiter: u64,
-) -> RunOutcome {
-    let n = init_params.len();
+    backend: super::lbfgsb::Backend,
+) -> super::lbfgsb::Outcome {
     let obj = objective.clone();
-    let eval_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let eval_count_inner = eval_count.clone();
-    let hit_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let hit_limit_inner = hit_limit.clone();
-
-    let evaluate = move |x: &[f64], g: &mut [f64]| -> anyhow::Result<f64> {
-        let count = eval_count_inner.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Enforce maxiter: the lbfgsb crate doesn't support it natively,
-        // so we stop producing useful gradients after the limit is reached,
-        // which causes the optimizer to terminate.
-        if count >= maxiter {
-            hit_limit_inner.store(true, std::sync::atomic::Ordering::Relaxed);
-            for g_i in g.iter_mut() {
-                *g_i = 0.0;
-            }
-            // Return current cost with zero gradient to trigger convergence
-            return match obj.eval_negloglike(x) {
-                Ok(c) if c.is_finite() => Ok(c),
-                _ => Ok(f64::MAX / 2.0),
-            };
-        }
-        eval_count_inner.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Fused function + gradient: builds StateSpace & KalmanInit only once
-        if let Ok((cost, ag)) = obj.eval_negloglike_with_gradient(x) {
-            if cost.is_finite() && ag.iter().all(|v| v.is_finite()) {
-                g[..n].copy_from_slice(&ag);
-                return Ok(cost);
-            }
-        }
-
-        // Fallback: separate function + numerical gradient
-        let cost = match obj.eval_negloglike(x) {
-            Ok(c) if c.is_finite() => c,
-            _ => {
-                for g_i in g.iter_mut() {
-                    *g_i = 0.0;
-                }
-                return Ok(f64::MAX / 2.0);
-            }
-        };
-
-        let mut x_work = x.to_vec();
-        for i in 0..n {
-            let eps_i = (1.0 + x_work[i].abs()) * 1e-7;
-            let orig = x_work[i];
-            x_work[i] = orig + eps_i;
-            let f_plus = match obj.eval_negloglike(&x_work) {
-                Ok(c) if c.is_finite() => c,
-                _ => cost,
-            };
-            x_work[i] = orig;
-            g[i] = (f_plus - cost) / eps_i;
-            if !g[i].is_finite() {
-                g[i] = 0.0;
-            }
-        }
-        Ok(cost)
-    };
-
-    let param = crate::lbfgsb_wrapper::LbfgsbParameter {
-        m: 10,       // memory size (scipy default: 10)
-        factr: 1e7,  // cost tolerance: factr * eps_mach ≈ 1e-9 (scipy default)
-        pgtol: 1e-5, // projected gradient tolerance (scipy default)
-        iprint: -1,  // silent
-    };
-
-    let mut problem = crate::lbfgsb_wrapper::LbfgsbProblem::build(init_params, evaluate);
-    problem.set_bounds(bounds_vec);
-
-    let mut state = crate::lbfgsb_wrapper::LbfgsbState::new(problem, param);
-    let final_task = state
-        .minimize()
-        .map_err(|e| format!("L-BFGS-B failed: {}", e))?;
-
-    let x = state.x().to_vec();
-    let cost = state.fx();
-    let n_eval = eval_count.load(std::sync::atomic::Ordering::Relaxed);
-
-    // Determine convergence from Fortran task code:
-    // - CONVERGENCE (20-25): solver converged via pgtol or factr
-    // - STOP/WARNING: solver stopped but not converged
-    // Additionally, if we hit our eval limit, report not converged.
-    let converged_by_solver = crate::lbfgsb_ffi::is_converged(final_task);
-    let converged = converged_by_solver && !hit_limit.load(std::sync::atomic::Ordering::Relaxed);
-
-    Ok((x, cost, n_eval, converged))
+    super::lbfgsb::minimize(
+        backend,
+        &KalmanObjective(&obj),
+        init_params,
+        bounds,
+        maxiter,
+    )
 }
 
 pub(super) fn consume_budget(remaining: &mut u64, total_work: &mut u64, n: u64) {
     let used = n.min(*remaining);
     *total_work = total_work.saturating_add(used);
     *remaining = remaining.saturating_sub(used);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numerical_gradient_recovers_from_invalid_analytical_gradient() {
+        let mut gradient = [0.0];
+        let cost = evaluate_with_fallback(
+            &[2.0],
+            &mut gradient,
+            || Ok((4.0, vec![f64::NAN])),
+            |x| Ok(x[0].powi(2)),
+        );
+        assert_eq!(cost, 4.0);
+        assert!((gradient[0] - 4.0).abs() < 1e-6);
+    }
 }

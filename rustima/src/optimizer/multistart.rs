@@ -7,13 +7,14 @@ use std::cell::RefCell;
 use crate::error::SarimaxError;
 use crate::types::SarimaxConfig;
 
-use super::passes_cancellation_filter;
-use super::transforms::untransform_params;
+use super::lbfgsb::{Backend, MethodOutcome as LbfgsbMethodOutcome, RunError};
 use super::objective::SarimaxObjective;
+use super::passes_cancellation_filter;
 use super::runners::{
     compute_bounds, consume_budget, run_bfgs, run_lbfgs, run_lbfgsb, run_nelder_mead,
     MethodOutcome, RunOutcome,
 };
+use super::transforms::untransform_params;
 
 // ---------------------------------------------------------------------------
 // Multi-start helpers (shared by lbfgsb-multi and lbfgs methods)
@@ -57,8 +58,7 @@ fn grid_ma_initialization(
             grid_constrained[sma_start + i] = ma_val;
         }
         if let Ok(grid_uncons) = untransform_params(&grid_constrained, config) {
-            if let Ok((p, c, n, conv)) =
-                run_nelder_mead(objective.clone(), grid_uncons, *remaining)
+            if let Ok((p, c, n, conv)) = run_nelder_mead(objective.clone(), grid_uncons, *remaining)
             {
                 consume_budget(remaining, total_work, n);
                 try_update_best(best, p, c, conv, method_label);
@@ -133,7 +133,13 @@ fn nm_refinement(
         match run_nelder_mead(objective.clone(), best_p.clone(), *remaining) {
             Ok((nm_p, nm_c, nm_n, nm_conv)) if nm_c < best_c => {
                 consume_budget(remaining, total_work, nm_n);
-                (nm_p, nm_c, *total_work, nm_conv, format!("{}+nm", method_name))
+                (
+                    nm_p,
+                    nm_c,
+                    *total_work,
+                    nm_conv,
+                    format!("{}+nm", method_name),
+                )
             }
             Ok((_, _, nm_n, _)) => {
                 consume_budget(remaining, total_work, nm_n);
@@ -221,8 +227,7 @@ where
         );
 
         // 3. LCG perturbations (with P6 near-cancellation filter, α=0.01)
-        let perturbations =
-            lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining);
+        let perturbations = lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining);
         for perturbed in perturbations {
             if remaining == 0 {
                 break;
@@ -269,28 +274,46 @@ pub(super) fn fit_lbfgsb_multi(
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-) -> MethodOutcome {
+    backend: Backend,
+) -> LbfgsbMethodOutcome {
     let bounds = compute_bounds(config);
     let n_params_total = unconstrained_start.len();
     let mut remaining = maxiter;
     let mut total_work: u64 = 0;
 
     // Initial run (sequential)
-    let mut best: Option<(Vec<f64>, f64, bool, String)> =
-        match run_lbfgsb(objective, unconstrained_start.to_vec(), bounds.clone(), remaining) {
-            Ok((p, c, n, conv)) => {
-                consume_budget(&mut remaining, &mut total_work, n);
-                Some((p, c, conv, "lbfgsb-multi".to_string()))
+    let mut best: Option<(Vec<f64>, f64, bool, String)> = match run_lbfgsb(
+        objective,
+        unconstrained_start.to_vec(),
+        bounds.clone(),
+        remaining,
+        backend,
+    ) {
+        Ok((p, c, n, conv)) => {
+            consume_budget(&mut remaining, &mut total_work, n);
+            Some((p, c, conv, "lbfgsb-multi".to_string()))
+        }
+        Err(error) => {
+            if backend.is_basin() {
+                consume_budget(&mut remaining, &mut total_work, error.work);
             }
-            Err(_) => None,
-        };
+            None
+        }
+    };
 
     if n_restarts > 0 && remaining > 0 {
         // 1. Zero-start (sequential)
         let zeros = vec![0.0; n_params_total];
-        if let Ok((p, c, n, conv)) = run_lbfgsb(objective, zeros, bounds.clone(), remaining) {
-            consume_budget(&mut remaining, &mut total_work, n);
-            try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
+        match run_lbfgsb(objective, zeros, bounds.clone(), remaining, backend) {
+            Ok((p, c, n, conv)) => {
+                consume_budget(&mut remaining, &mut total_work, n);
+                try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
+            }
+            Err(error) => {
+                if backend.is_basin() {
+                    consume_budget(&mut remaining, &mut total_work, error.work);
+                }
+            }
         }
 
         // 2. Grid MA initialization (sequential NM, gradient-free)
@@ -305,10 +328,11 @@ pub(super) fn fit_lbfgsb_multi(
         );
 
         // 3. LCG perturbations — PARALLEL via rayon (with P6 near-cancellation filter, α=0.01)
-        let perturbations: Vec<_> = lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining)
-            .into_iter()
-            .filter(|start| passes_cancellation_filter(start, config))
-            .collect();
+        let perturbations: Vec<_> =
+            lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining)
+                .into_iter()
+                .filter(|start| passes_cancellation_filter(start, config))
+                .collect();
         // Skip the rayon block in a fork()ed child — the inherited pool would deadlock (C1/C2).
         if perturbations.len() >= 2 && remaining > 0 && crate::batch::guard_rayon_fork().is_ok() {
             let per_start_budget = remaining / perturbations.len() as u64;
@@ -322,7 +346,7 @@ pub(super) fn fit_lbfgsb_multi(
 
                 let results: Vec<_> = perturbations
                     .into_par_iter()
-                    .filter_map(|start| {
+                    .map(|start| {
                         let obj = SarimaxObjective {
                             endog: endog_shared.clone(),
                             config: config_shared.clone(),
@@ -330,15 +354,33 @@ pub(super) fn fit_lbfgsb_multi(
                             cache: RefCell::new(None),
                             ss_cache: RefCell::new(None),
                         };
-                        run_lbfgsb(&obj, start, bounds_shared.clone(), per_start_budget).ok()
+                        run_lbfgsb(
+                            &obj,
+                            start,
+                            bounds_shared.clone(),
+                            per_start_budget,
+                            backend,
+                        )
                     })
                     .collect();
 
-                let par_work: u64 = results.iter().map(|(_, _, n, _)| n).sum();
+                let par_work: u64 = results
+                    .iter()
+                    .map(|result| match result {
+                        Ok((_, _, n, _)) => *n,
+                        Err(error) => {
+                            if backend.is_basin() {
+                                error.work
+                            } else {
+                                0
+                            }
+                        }
+                    })
+                    .sum();
                 total_work = total_work.saturating_add(par_work);
                 remaining = remaining.saturating_sub(par_work);
 
-                for (p, c, _, conv) in results {
+                for (p, c, _, conv) in results.into_iter().flatten() {
                     try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
                 }
             }
@@ -348,11 +390,16 @@ pub(super) fn fit_lbfgsb_multi(
                 if remaining == 0 {
                     break;
                 }
-                if let Ok((p, c, n, conv)) =
-                    run_lbfgsb(objective, perturbed, bounds.clone(), remaining)
-                {
-                    consume_budget(&mut remaining, &mut total_work, n);
-                    try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
+                match run_lbfgsb(objective, perturbed, bounds.clone(), remaining, backend) {
+                    Ok((p, c, n, conv)) => {
+                        consume_budget(&mut remaining, &mut total_work, n);
+                        try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
+                    }
+                    Err(error) => {
+                        if backend.is_basin() {
+                            consume_budget(&mut remaining, &mut total_work, error.work);
+                        }
+                    }
                 }
             }
         }
@@ -371,9 +418,18 @@ pub(super) fn fit_lbfgsb_multi(
             &mut total_work,
         )),
         None => {
+            if remaining == 0 {
+                return Err(RunError {
+                    message: "L-BFGS-B failed within the evaluation budget".into(),
+                    work: total_work,
+                });
+            }
             let (p, c, n, conv) =
                 run_nelder_mead(objective.clone(), unconstrained_start.to_vec(), remaining)
-                    .map_err(SarimaxError::OptimizationFailed)?;
+                    .map_err(|message| RunError {
+                        message,
+                        work: maxiter,
+                    })?;
             consume_budget(&mut remaining, &mut total_work, n);
             Ok((p, c, total_work, conv, "nelder-mead (fallback)".to_string()))
         }
@@ -410,9 +466,8 @@ pub(super) fn fit_bfgs_single(
     match run_bfgs(objective.clone(), unconstrained_start.clone(), maxiter) {
         Ok((p, c, n, conv)) => Ok((p, c, n, conv, "bfgs".to_string())),
         Err(_) => {
-            let (p, c, n, conv) =
-                run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
-                    .map_err(SarimaxError::OptimizationFailed)?;
+            let (p, c, n, conv) = run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
+                .map_err(SarimaxError::OptimizationFailed)?;
             Ok((p, c, n, conv, "nelder-mead (fallback)".to_string()))
         }
     }
@@ -424,25 +479,61 @@ pub(super) fn fit_lbfgsb_single(
     unconstrained_start: Vec<f64>,
     config: &SarimaxConfig,
     maxiter: u64,
-) -> MethodOutcome {
+    backend: Backend,
+) -> LbfgsbMethodOutcome {
     let bounds = compute_bounds(config);
-    match run_lbfgsb(objective, unconstrained_start.clone(), bounds, maxiter) {
-        Ok((p, c, n, conv)) => {
-            Ok((p, c, n, conv, "lbfgsb".to_string()))
-        }
-        Err(_) => {
-            // Single-start L-BFGS-B failed (typically ABNORMAL_TERMINATION_IN_LNSRCH
-            // when the CSS start sits on an AR/MA near-cancellation ridge). Escalate
-            // to multi-start, which perturbs the start and keeps the best basin —
-            // plain Nelder-Mead from the same start would only polish the bad basin.
+    match run_lbfgsb(
+        objective,
+        unconstrained_start.clone(),
+        bounds,
+        maxiter,
+        backend,
+    ) {
+        Ok((p, c, n, conv)) => Ok((p, c, n, conv, "lbfgsb".into())),
+        Err(_) if !backend.is_basin() => {
+            // Preserve the original fallback budgets for comparisons.
             let n_restarts = compute_n_restarts(unconstrained_start.len(), config);
-            match fit_lbfgsb_multi(objective, &unconstrained_start, config, maxiter, n_restarts) {
-                Ok((p, c, n, conv, m)) => Ok((p, c, n, conv, format!("{} (fallback)", m))),
+            match fit_lbfgsb_multi(
+                objective,
+                &unconstrained_start,
+                config,
+                maxiter,
+                n_restarts,
+                backend,
+            ) {
+                Ok((p, c, n, conv, method)) => Ok((p, c, n, conv, format!("{method} (fallback)"))),
                 Err(_) => {
                     let (p, c, n, conv) =
-                        run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
-                            .map_err(SarimaxError::OptimizationFailed)?;
-                    Ok((p, c, n, conv, "nelder-mead (fallback)".to_string()))
+                        run_nelder_mead(objective.clone(), unconstrained_start, maxiter).map_err(
+                            |message| RunError {
+                                message,
+                                work: maxiter,
+                            },
+                        )?;
+                    Ok((p, c, n, conv, "nelder-mead (fallback)".into()))
+                }
+            }
+        }
+        Err(error) => {
+            let remaining = maxiter.saturating_sub(error.work);
+            if remaining == 0 {
+                return Err(error);
+            }
+            let n_restarts = compute_n_restarts(unconstrained_start.len(), config);
+            match fit_lbfgsb_multi(
+                objective,
+                &unconstrained_start,
+                config,
+                remaining,
+                n_restarts,
+                backend,
+            ) {
+                Ok((p, c, n, conv, method)) => {
+                    Ok((p, c, n + error.work, conv, format!("{method} (fallback)")))
+                }
+                Err(mut failure) => {
+                    failure.work += error.work;
+                    Err(failure)
                 }
             }
         }
@@ -486,28 +577,42 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-) -> MethodOutcome {
+    backend: Backend,
+) -> LbfgsbMethodOutcome {
     let bounds = compute_bounds(config);
     let n_dim = unconstrained_start.len();
     let k = n_restarts.max(3);
 
-    // Each restart (baseline + K perturbations) runs to its own convergence with
-    // the full maxiter budget. The K perturbations run in parallel via Rayon, so
-    // wall time is roughly 2× single-start (baseline then parallel K).
-    // For SARIMAX where rustima is ~5-20× faster than statsmodels, this is
-    // still a net win in wall time AND solution quality.
-    let per_restart_budget = maxiter.max(50);
+    // Basin shares the work budget across the baseline and perturbations.
+    // The legacy backend retains its original per-restart allocation.
+    let baseline_budget = if backend.is_basin() {
+        (maxiter / 2).max(1)
+    } else {
+        maxiter
+    };
+    let mut total_work = 0_u64;
 
     // 1. Baseline from seed — run to convergence. The result is our anchor for
     //    basin hopping: perturbations explore around the LOCAL OPTIMUM, not the
     //    seed, because uniform exploration around the seed lands in the same
     //    basin (it's the same gravitational well). Hopping from the converged
     //    point gives a real chance to escape into neighboring basins.
-    let mut best: Option<(Vec<f64>, f64, bool, String)> =
-        match fit_lbfgsb_single(objective, unconstrained_start.clone(), config, maxiter) {
-            Ok((p, c, _n, conv, name)) => Some((p, c, conv, name)),
-            Err(_) => None,
-        };
+    let mut best: Option<(Vec<f64>, f64, bool, String)> = match fit_lbfgsb_single(
+        objective,
+        unconstrained_start.clone(),
+        config,
+        baseline_budget,
+        backend,
+    ) {
+        Ok((p, c, n, conv, name)) => {
+            total_work += n;
+            Some((p, c, conv, name))
+        }
+        Err(error) => {
+            total_work += error.work;
+            None
+        }
+    };
     // Anchor for perturbation = converged baseline (or seed if baseline failed).
     let anchor: Vec<f64> = best
         .as_ref()
@@ -525,7 +630,11 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
     };
 
     // 3. Per-dim relative magnitudes ∈ [0, 1], floored so no dim is fully frozen
-    let max_abs = grad.iter().map(|g| g.abs()).fold(0.0_f64, f64::max).max(1e-12);
+    let max_abs = grad
+        .iter()
+        .map(|g| g.abs())
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
     let rel_grad: Vec<f64> = grad.iter().map(|g| (g.abs() / max_abs).max(0.1)).collect();
 
     // 4. Generate K perturbations via deterministic LCG (no extra deps, reproducible).
@@ -577,14 +686,22 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
     }
 
     // 5. Run K L-BFGS-Bs in parallel via Rayon
-    if !perturbations.is_empty() && crate::batch::guard_rayon_fork().is_ok() {
+    let per_restart_budget = if backend.is_basin() {
+        maxiter.saturating_sub(total_work) / perturbations.len().max(1) as u64
+    } else {
+        maxiter.max(50)
+    };
+    if !perturbations.is_empty()
+        && per_restart_budget > 0
+        && crate::batch::guard_rayon_fork().is_ok()
+    {
         let endog_shared = &objective.endog;
         let config_shared = &objective.config;
         let exog_shared = &objective.exog;
         let bounds_shared = &bounds;
         let results: Vec<_> = perturbations
             .into_par_iter()
-            .filter_map(|start| {
+            .map(|start| {
                 let obj = SarimaxObjective {
                     endog: endog_shared.clone(),
                     config: config_shared.clone(),
@@ -592,17 +709,48 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
                     cache: RefCell::new(None),
                     ss_cache: RefCell::new(None),
                 };
-                run_lbfgsb(&obj, start, bounds_shared.clone(), per_restart_budget).ok()
+                run_lbfgsb(
+                    &obj,
+                    start,
+                    bounds_shared.clone(),
+                    per_restart_budget,
+                    backend,
+                )
             })
             .collect();
-        for (p, c, _, conv) in results {
-            try_update_best(&mut best, p, c, conv, "lbfgsb-adaptive");
+        for result in results {
+            match result {
+                Ok((p, c, n, conv)) => {
+                    total_work += n;
+                    try_update_best(&mut best, p, c, conv, "lbfgsb-adaptive");
+                }
+                Err(error) => total_work += error.work,
+            }
         }
     }
 
     match best {
-        Some((p, c, conv, name)) => Ok((p, c, maxiter, conv, name)),
-        None => fit_lbfgsb_single(objective, unconstrained_start, config, maxiter),
+        Some((p, c, conv, name)) => Ok((
+            p,
+            c,
+            if backend.is_basin() {
+                total_work
+            } else {
+                maxiter
+            },
+            conv,
+            name,
+        )),
+        None if backend.is_basin() => {
+            let remaining = maxiter.saturating_sub(total_work);
+            fit_lbfgsb_single(objective, unconstrained_start, config, remaining, backend)
+                .map(|(p, c, n, conv, name)| (p, c, total_work + n, conv, name))
+                .map_err(|mut error| {
+                    error.work += total_work;
+                    error
+                })
+        }
+        None => fit_lbfgsb_single(objective, unconstrained_start, config, maxiter, backend),
     }
 }
 
@@ -628,10 +776,23 @@ pub(super) fn fit_lbfgsb_hybrid(
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-) -> MethodOutcome {
+    backend: Backend,
+) -> LbfgsbMethodOutcome {
     // Stage 1: standard multi-start
-    let (multi_p, multi_c, multi_iter, multi_conv, _orig_name) =
-        fit_lbfgsb_multi(objective, unconstrained_start, config, maxiter, n_restarts)?;
+    let multi_budget = if backend.is_basin() {
+        (maxiter / 2).max(1)
+    } else {
+        maxiter
+    };
+    let (multi_p, multi_c, multi_iter, multi_conv, orig_name) = fit_lbfgsb_multi(
+        objective,
+        unconstrained_start,
+        config,
+        multi_budget,
+        n_restarts,
+        backend,
+    )?;
+    let mut total_work = multi_iter;
 
     let n_dim = unconstrained_start.len();
     let k = n_restarts.max(3);
@@ -642,7 +803,11 @@ pub(super) fn fit_lbfgsb_hybrid(
         Ok(g) if g.len() == n_dim => g,
         _ => vec![1.0; n_dim],
     };
-    let max_abs = grad.iter().map(|g| g.abs()).fold(0.0_f64, f64::max).max(1e-12);
+    let max_abs = grad
+        .iter()
+        .map(|g| g.abs())
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
     let rel_grad: Vec<f64> = grad.iter().map(|g| (g.abs() / max_abs).max(0.1)).collect();
 
     let mut lcg_state: u64 = 0xA7F3_5B2E_1290_C84B;
@@ -666,18 +831,31 @@ pub(super) fn fit_lbfgsb_hybrid(
         .filter(|p: &Vec<f64>| passes_cancellation_filter(p, config))
         .collect();
 
-    let mut best: Option<(Vec<f64>, f64, bool, String)> =
-        Some((multi_p, multi_c, multi_conv, "lbfgsb-hybrid".to_string()));
+    let mut best: Option<(Vec<f64>, f64, bool, String)> = Some((
+        multi_p,
+        multi_c,
+        multi_conv,
+        if backend.is_basin() && orig_name.contains("nm") {
+            "lbfgsb-hybrid+nm"
+        } else {
+            "lbfgsb-hybrid"
+        }
+        .into(),
+    ));
 
-    if !perturbations.is_empty() && crate::batch::guard_rayon_fork().is_ok() {
+    let polish_budget = if backend.is_basin() {
+        maxiter.saturating_sub(total_work) / perturbations.len().max(1) as u64
+    } else {
+        (maxiter / 2).max(50)
+    };
+    if !perturbations.is_empty() && polish_budget > 0 && crate::batch::guard_rayon_fork().is_ok() {
         let endog_shared = &objective.endog;
         let config_shared = &objective.config;
         let exog_shared = &objective.exog;
         let bounds_shared = &bounds;
-        let polish_budget = (maxiter / 2).max(50);
         let results: Vec<_> = perturbations
             .into_par_iter()
-            .filter_map(|start| {
+            .map(|start| {
                 let obj = SarimaxObjective {
                     endog: endog_shared.clone(),
                     config: config_shared.clone(),
@@ -685,16 +863,32 @@ pub(super) fn fit_lbfgsb_hybrid(
                     cache: RefCell::new(None),
                     ss_cache: RefCell::new(None),
                 };
-                run_lbfgsb(&obj, start, bounds_shared.clone(), polish_budget).ok()
+                run_lbfgsb(&obj, start, bounds_shared.clone(), polish_budget, backend)
             })
             .collect();
-        for (p, c, _, conv) in results {
-            try_update_best(&mut best, p, c, conv, "lbfgsb-hybrid");
+        for result in results {
+            match result {
+                Ok((p, c, n, conv)) => {
+                    total_work += n;
+                    try_update_best(&mut best, p, c, conv, "lbfgsb-hybrid");
+                }
+                Err(error) => total_work += error.work,
+            }
         }
     }
 
     match best {
-        Some((p, c, conv, name)) => Ok((p, c, multi_iter, conv, name)),
-        None => fit_lbfgsb_multi(objective, unconstrained_start, config, maxiter, n_restarts),
+        Some((p, c, conv, name)) => Ok((
+            p,
+            c,
+            if backend.is_basin() {
+                total_work
+            } else {
+                multi_iter
+            },
+            conv,
+            name,
+        )),
+        None => unreachable!("multi-start supplied an incumbent"),
     }
 }

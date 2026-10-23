@@ -71,10 +71,81 @@ fn bench_fit_sarima_111_111_12(c: &mut Criterion) {
     });
 }
 
+fn bench_lbfgsb_comparison(c: &mut Criterion) {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/statsmodels_reference.json")).unwrap();
+    let mut group = c.benchmark_group("lbfgsb_comparison");
+    for name in ["ar1", "arma11", "arima111", "sarima_100_100_4"] {
+        let case = &fixtures[name];
+        let data: Vec<f64> = case["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let order: Vec<usize> = case["order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let seasonal: Vec<usize> = case["seasonal_order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let config = SarimaxConfig {
+            order: SarimaxOrder::new(
+                order[0],
+                order[1],
+                order[2],
+                seasonal[0],
+                seasonal[1],
+                seasonal[2],
+                seasonal[3],
+            ),
+            concentrate_scale: true,
+            enforce_stationarity: true,
+            enforce_invertibility: true,
+            ..SarimaxConfig::default()
+        };
+        let start: Vec<f64> = case["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(order[0] + order[2] + seasonal[0] + seasonal[2])
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let methods = [
+            "lbfgsb-strict",
+            #[cfg(feature = "basin")]
+            "basin-lbfgsb-strict",
+        ];
+        for method in methods {
+            group.bench_function(criterion::BenchmarkId::new(name, method), |b| {
+                b.iter(|| {
+                    optimizer::fit(
+                        std::hint::black_box(&data),
+                        &config,
+                        Some(&start),
+                        Some(method),
+                        Some(500),
+                        None,
+                    )
+                    .unwrap()
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fit_ar1,
     bench_fit_arima111,
-    bench_fit_sarima_111_111_12
+    bench_fit_sarima_111_111_12,
+    bench_lbfgsb_comparison
 );
 criterion_main!(benches);

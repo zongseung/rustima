@@ -62,7 +62,7 @@ Fit a SARIMAX model via Maximum Likelihood Estimation.
 | `concentrate_scale` | `bool` | `True` | Concentrate sigma2 |
 | `enforce_stationarity` | `bool` | `True` | Enforce AR stationarity |
 | `enforce_invertibility` | `bool` | `True` | Enforce MA invertibility |
-| `method` | `str` or `None` | `None` | Optimizer: `"lbfgsb"` (default), `"lbfgsb-multi"`, `"lbfgsb-strict"`, `"lbfgs"`, or `"nelder-mead"` |
+| `method` | `str` or `None` | `None` | Optimizer: `"lbfgsb"` (default), `"lbfgsb-multi"`, `"lbfgsb-strict"`, `"lbfgs"`, or `"nelder-mead"`. With Cargo feature `basin`, prefix an L-BFGS-B strategy with `"basin-"`. |
 | `maxiter` | `int` or `None` | `None` | Maximum optimizer work units (default 500). When `0`, returns start params with `converged=False` immediately. |
 
 **Returns:** `dict` with keys:
@@ -74,10 +74,10 @@ Fit a SARIMAX model via Maximum Likelihood Estimation.
 | `aic` | `float` | Akaike Information Criterion |
 | `bic` | `float` | Bayesian Information Criterion |
 | `scale` | `float` | Estimated variance (sigma2) |
-| `converged` | `bool` | Whether optimizer truly converged (`TerminationReason::SolverConverged` or `TargetCostReached`). `False` when `maxiter` was exhausted or `maxiter=0`. |
+| `converged` | `bool` | Whether the optimizer satisfied its convergence criteria. Basin uses its convergence report; budget exhaustion reports `False`. Iterative fits with `maxiter=0` report `False`. |
 | `method` | `str` | Optimization method used (e.g. `"lbfgsb"`, `"lbfgs+nm"`, `"nelder-mead (fallback)"`) |
 | `n_obs` | `int` | Number of observations |
-| `n_iter` | `int` | Total optimizer work units: solver iterations for L-BFGS/NM, function evaluations for L-BFGS-B. Multi-start methods report cumulative sum across all sub-runs, capped by `maxiter`. |
+| `n_iter` | `int` | Total optimizer work units: solver iterations for L-BFGS/NM, fused function and gradient evaluations for L-BFGS-B. Basin strategies report cumulative work capped by `maxiter`. |
 | `n_params` | `int` | Number of estimated parameters |
 
 **Example:**

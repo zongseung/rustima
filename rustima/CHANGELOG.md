@@ -3,6 +3,14 @@
 All notable changes to rustima are documented here.
 Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
+## Unreleased
+
+- Add an optional Basin 3.0.0 L-BFGS-B backend, selected with
+  `method="basin-lbfgsb"` and its strict, multi-start, adaptive, and hybrid
+  variants. Include numerical comparisons, convergence checks, and benchmarks.
+- Correct the minimum Rust version to 1.87, matching the existing nalgebra
+  dependency, and test both optimizer backends on that toolchain.
+
 ## 0.3.0 — 2026-07-25
 
 A diagnosis sweep of the engine (~1,800 adversarial inputs, 9 numerical

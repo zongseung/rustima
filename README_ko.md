@@ -1,6 +1,6 @@
 # rustima
 
-[![Rust](https://img.shields.io/badge/Rust-1.83%2B-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
@@ -98,7 +98,7 @@ rustima를 Rust 소스에서 빌드하려면 다음이 필요합니다:
 
 | 도구 | 최소 버전 | 용도 | 설치 |
 |------|---------|-----|---------|
-| **Rust** | 1.83+ | 엔진 컴파일 | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **Rust** | 1.87+ | 엔진 컴파일 | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | **Python** | 3.10+ | 확장 모듈 호스팅 | [python.org](https://www.python.org/) 또는 `pyenv` |
 | **uv** | 최신 | 빠른 Python 패키지/환경 관리 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **maturin** | 1.7+ | Rust ↔ Python 브리지 (`uv sync --extra dev` 시 자동 설치) | — |

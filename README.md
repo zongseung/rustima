@@ -1,6 +1,6 @@
 # rustima
 
-[![Rust](https://img.shields.io/badge/Rust-1.83%2B-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
@@ -98,7 +98,7 @@ Building rustima from its Rust source requires:
 
 | Tool | Minimum | Why | Install |
 |------|---------|-----|---------|
-| **Rust** | 1.83+ | Compiles the engine | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **Rust** | 1.87+ | Compiles the engine | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | **Python** | 3.10+ | Hosts the extension | [python.org](https://www.python.org/) or `pyenv` |
 | **uv** | latest | Fast Python package/env manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **maturin** | 1.7+ | Rust ↔ Python bridge (auto-installed by `uv sync --extra dev`) | — |
@@ -138,6 +138,11 @@ uv pip install --force-reinstall /tmp/wheels/rustima-*.whl
 ```
 
 Copy the `.whl` from `/tmp/wheels/` to the target machine and `pip install` it there (must have the same OS + Python version).
+
+### Optional Basin optimizer
+
+Build from source with `maturin develop --release --features basin`, then select
+`method="basin-lbfgsb"` in fitting or auto-ARIMA.
 
 ### Verifying the install
 
