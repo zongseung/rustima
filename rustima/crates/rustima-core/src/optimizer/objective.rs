@@ -4,7 +4,8 @@ use std::cell::RefCell;
 
 use nalgebra::{DMatrix, DVector};
 
-use argmin::core::{CostFunction, Gradient};
+use basin::{CostFunction, Gradient};
+use std::convert::Infallible;
 
 use crate::css;
 use crate::initialization::KalmanInit;
@@ -14,17 +15,17 @@ use crate::score;
 use crate::state_space::StateSpace;
 use crate::types::SarimaxConfig;
 
-use super::KF_FT_FALLBACK_VARIANCE;
 use super::transforms::{apply_transform_jacobian, expected_param_len, transform_params};
+use super::KF_FT_FALLBACK_VARIANCE;
 
 // ---------------------------------------------------------------------------
-// Objective function for argmin
+// Objective function for Basin
 // ---------------------------------------------------------------------------
 
 /// Cached fused evaluation result (cost + gradient at same params).
 ///
 /// Used by L-BFGS path to avoid redundant StateSpace construction when
-/// argmin calls `cost()` and `gradient()` at the same parameter point.
+/// the solver calls `cost()` and `gradient()` at the same parameter point.
 pub(super) struct CachedEval {
     params: Vec<f64>,
     cost: f64,
@@ -58,10 +59,7 @@ impl Clone for SarimaxObjective {
 
 impl SarimaxObjective {
     /// Take cached StateSpace (updating in-place) or build a new one.
-    fn take_or_build_ss(
-        &self,
-        sparams: &SarimaxParams,
-    ) -> std::result::Result<StateSpace, String> {
+    fn take_or_build_ss(&self, sparams: &SarimaxParams) -> std::result::Result<StateSpace, String> {
         match self.ss_cache.borrow_mut().take() {
             Some(mut ss) => {
                 ss.update_params(&self.config, sparams, &self.endog, self.exog.as_deref());
@@ -97,7 +95,10 @@ impl SarimaxObjective {
 
     /// Evaluate negative log-likelihood for given unconstrained parameters.
     /// Used by L-BFGS-B which minimizes directly.
-    pub(super) fn eval_negloglike(&self, unconstrained: &[f64]) -> std::result::Result<f64, String> {
+    pub(super) fn eval_negloglike(
+        &self,
+        unconstrained: &[f64],
+    ) -> std::result::Result<f64, String> {
         self.eval_loglike(unconstrained).map(|ll| -ll)
     }
 
@@ -246,7 +247,10 @@ pub(super) struct ProfiledSarimaxObjective {
 }
 
 impl ProfiledSarimaxObjective {
-    pub(super) fn eval_profiled(&self, profiled_unconstrained: &[f64]) -> std::result::Result<ProfiledEval, String> {
+    pub(super) fn eval_profiled(
+        &self,
+        profiled_unconstrained: &[f64],
+    ) -> std::result::Result<ProfiledEval, String> {
         if profiled_unconstrained.len() != profiled_param_len(&self.config) {
             return Err(format!(
                 "profiled parameter length mismatch: expected {}, got {}",
@@ -260,12 +264,11 @@ impl ProfiledSarimaxObjective {
             insert_exog_block(profiled_unconstrained, &zero_beta, &self.config);
         let full_zero_constrained =
             transform_params(&full_zero_unconstrained, &self.config).map_err(|e| e.to_string())?;
-        let zero_params =
-            SarimaxParams::from_flat(&full_zero_constrained, &self.config).map_err(|e| e.to_string())?;
+        let zero_params = SarimaxParams::from_flat(&full_zero_constrained, &self.config)
+            .map_err(|e| e.to_string())?;
 
         let (beta_hat, loglike) = self.profile_beta_and_loglike(&zero_params)?;
-        let full_unconstrained =
-            insert_exog_block(profiled_unconstrained, &beta_hat, &self.config);
+        let full_unconstrained = insert_exog_block(profiled_unconstrained, &beta_hat, &self.config);
         let full_constrained =
             transform_params(&full_unconstrained, &self.config).map_err(|e| e.to_string())?;
         let full_params =
@@ -287,9 +290,8 @@ impl ProfiledSarimaxObjective {
             let ss = StateSpace::new(&self.config, zero_params, &self.endog, None)
                 .map_err(|e| e.to_string())?;
             let init = KalmanInit::from_config_default(&ss, &self.config);
-            let output =
-                kalman_loglike(&self.endog, &ss, &init, self.config.concentrate_scale)
-                    .map_err(|e| e.to_string())?;
+            let output = kalman_loglike(&self.endog, &ss, &init, self.config.concentrate_scale)
+                .map_err(|e| e.to_string())?;
             return Ok((Vec::new(), output.loglike));
         }
 
@@ -323,9 +325,8 @@ impl ProfiledSarimaxObjective {
             obs_refs.push(col.as_slice());
         }
 
-        let batched =
-            kalman_filter_batched(&obs_refs, &ss, &init, self.config.concentrate_scale)
-                .map_err(|e| e.to_string())?;
+        let batched = kalman_filter_batched(&obs_refs, &ss, &init, self.config.concentrate_scale)
+            .map_err(|e| e.to_string())?;
 
         let n_eff = batched.n_obs_effective;
         if n_eff == 0 {
@@ -411,7 +412,10 @@ impl ProfiledSarimaxObjective {
         }
     }
 
-    pub(super) fn eval_negloglike(&self, profiled_unconstrained: &[f64]) -> std::result::Result<f64, String> {
+    pub(super) fn eval_negloglike(
+        &self,
+        profiled_unconstrained: &[f64],
+    ) -> std::result::Result<f64, String> {
         self.eval_profiled(profiled_unconstrained).map(|e| e.negll)
     }
 
@@ -448,8 +452,9 @@ impl ProfiledSarimaxObjective {
 impl CostFunction for SarimaxObjective {
     type Param = Vec<f64>;
     type Output = f64;
+    type Error = Infallible;
 
-    fn cost(&self, param: &Vec<f64>) -> std::result::Result<f64, argmin::core::Error> {
+    fn cost(&self, param: &Vec<f64>) -> std::result::Result<f64, Self::Error> {
         // Check cache (populated by gradient() via fused eval)
         if let Some(ref cached) = *self.cache.borrow() {
             if cached.params == *param {
@@ -458,17 +463,24 @@ impl CostFunction for SarimaxObjective {
         }
 
         match self.eval_loglike(param) {
-            Ok(ll) => Ok(-ll),            // minimize negative log-likelihood
-            Err(_) => Ok(f64::MAX / 2.0), // penalty for invalid parameters
+            Ok(ll) if ll.is_finite() => Ok(-ll),
+            _ => Ok(f64::INFINITY), // Basin soft-rejects invalid trial points.
         }
     }
 }
 
 impl Gradient for SarimaxObjective {
-    type Param = Vec<f64>;
     type Gradient = Vec<f64>;
 
-    fn gradient(&self, param: &Vec<f64>) -> std::result::Result<Vec<f64>, argmin::core::Error> {
+    fn cost_and_gradient(
+        &self,
+        param: &Vec<f64>,
+    ) -> std::result::Result<(f64, Vec<f64>), Self::Error> {
+        let gradient = self.gradient(param)?;
+        Ok((self.cost(param)?, gradient))
+    }
+
+    fn gradient(&self, param: &Vec<f64>) -> std::result::Result<Vec<f64>, Self::Error> {
         // Check cache (populated by a previous fused eval at same params)
         if let Some(ref cached) = *self.cache.borrow() {
             if cached.params == *param {
@@ -547,20 +559,23 @@ pub(super) struct CssObjective {
 impl CostFunction for CssObjective {
     type Param = Vec<f64>;
     type Output = f64;
+    type Error = Infallible;
 
-    fn cost(&self, unconstrained: &Vec<f64>) -> std::result::Result<f64, argmin::core::Error> {
+    fn cost(&self, unconstrained: &Vec<f64>) -> std::result::Result<f64, Self::Error> {
         match transform_params(unconstrained, &self.config) {
             Ok(constrained) => match SarimaxParams::from_flat(&constrained, &self.config) {
                 Ok(sparams) => {
                     let ll = css::css_loglike_with_exog(
-                        &self.endog, &self.config, &sparams,
+                        &self.endog,
+                        &self.config,
+                        &sparams,
                         self.exog.as_deref(),
                     );
-                    Ok(if ll.is_finite() { -ll } else { f64::MAX / 2.0 })
+                    Ok(if ll.is_finite() { -ll } else { f64::INFINITY })
                 }
-                Err(_) => Ok(f64::MAX / 2.0),
+                Err(_) => Ok(f64::INFINITY),
             },
-            Err(_) => Ok(f64::MAX / 2.0),
+            Err(_) => Ok(f64::INFINITY),
         }
     }
 }

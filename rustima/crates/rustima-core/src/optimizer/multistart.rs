@@ -416,8 +416,8 @@ pub(super) fn fit_lbfgsb_multi(
     }
 }
 
-/// Multi-start L-BFGS (argmin) with grid search and NM refinement.
-pub(super) fn fit_lbfgs_argmin(
+/// Multi-start Basin L-BFGS with grid search and Nelder-Mead refinement.
+pub(super) fn fit_lbfgs_multi(
     objective: &SarimaxObjective,
     unconstrained_start: &[f64],
     config: &SarimaxConfig,

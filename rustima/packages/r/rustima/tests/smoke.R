@@ -15,6 +15,13 @@ stopifnot(abs(ll - fit$loglike) < 1e-8)
 reference <- stats::arima(y, c(1, 0, 0), include.mean = FALSE, method = "ML")
 stopifnot(abs(as.numeric(logLik(reference)) - fit$loglike) < 1e-4,
           abs(coef(reference)[1] - fit$params[1]) < 1e-3)
+for (method in c("lbfgs", "bfgs", "nm")) {
+    alternative <- sarimax(y, c(1, 0, 0), optimizer = method)
+    stopifnot(alternative$converged, abs(alternative$loglike - fit$loglike) < 1e-4)
+    parallel <- sarimax_batch(list(y, y), c(1, 0, 0), optimizer = method, nthreads = 2)
+    stopifnot(all(vapply(parallel, function(f) f$converged &&
+              identical(f$params, alternative$params), logical(1))))
+}
 fc <- predict(fit, 8L)
 stopifnot(length(fc$pred) == 8L, all(is.finite(fc$pred)), all(fc$se > 0),
           all(fc$lower < fc$pred), all(fc$upper > fc$pred),

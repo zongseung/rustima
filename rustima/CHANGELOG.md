@@ -3,6 +3,12 @@
 All notable changes to rustima are documented here.
 Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
+## Unreleased
+
+- Replace argmin's L-BFGS, BFGS and Nelder-Mead solvers with Basin 3.0, including
+  CSS initialization and fallback refinement. Preserve API names, BFGS diagonal
+  preconditioning and simplex construction, and remove argmin dependencies.
+
 ## 0.4.0rc1 — distribution preparation
 
 - Separate the shared `rustima-core`, Python package and R package directories.

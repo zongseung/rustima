@@ -14,10 +14,11 @@ forecasts with prediction intervals. Independent series and explicit order
 candidates can be fitted in parallel with Rayon.
 
 The upcoming Python `0.4.0rc1` and R `0.1.0` preview share one Rust core.
-L-BFGS-B uses **Basin 3.0** by default. The previous vendored C optimizer is
-removed; `lbfgsb` and `basin-lbfgsb` select the same backend. Trust-region and
-profile-trust-region remain available. Basin's `n_iter` counts objective/gradient
-evaluations, including line search, rather than accepted optimizer steps.
+L-BFGS-B (default), L-BFGS, BFGS and Nelder-Mead use **Basin 3.0**. The previous
+vendored C optimizer is removed; `lbfgsb` and `basin-lbfgsb` select the same
+backend. Trust-region and profile-trust-region remain rustima implementations.
+L-BFGS-B's `n_iter` counts objective/gradient evaluations, including line search;
+the other Basin methods count completed solver iterations.
 
 ## Python
 

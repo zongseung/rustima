@@ -12,10 +12,12 @@ Kalman 우도·최적화·예측을 호출하며, 외생변수와 Rayon 기반 �
 지원합니다. 기본 우도를 Whittle 근사로 대체하지 않습니다.
 
 현재 준비 중인 버전은 Python `0.4.0rc1`, R `0.1.0` preview입니다.
-기본 L-BFGS-B는 **Basin 3.0**을 사용합니다. 기존 C 최적화 코드와 빌드 스크립트를
+L-BFGS-B(기본)·L-BFGS·BFGS·Nelder-Mead는 **Basin 3.0**을 사용합니다.
+기존 C 최적화 코드와 빌드 스크립트를
 제거했고, `lbfgsb`와 `basin-lbfgsb` 이름을 모두 유지했습니다.
 trust-region·profile-trust-region도 공통 Rust 코어에 남아 있습니다.
-Basin의 `n_iter`는 line search를 포함한 목적함수·gradient 평가 횟수입니다.
+L-BFGS-B의 `n_iter`는 line search를 포함한 목적함수·gradient 평가 횟수이며,
+나머지 Basin 방법은 완료한 solver 반복 횟수를 셉니다.
 
 ## Python
 

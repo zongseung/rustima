@@ -27,6 +27,9 @@ def check():
         ((1, 0, 1), (1, 0, 0, 4), False, "lbfgsb"),
         ((1, 0, 0), (0, 0, 0, 0), True, "lbfgsb"),
         ((1, 0, 0), (0, 0, 0, 0), True, "profile-trust-region"),
+        ((1, 0, 0), (0, 0, 0, 0), True, "lbfgs"),
+        ((1, 0, 0), (0, 0, 0, 0), True, "bfgs"),
+        ((1, 0, 0), (0, 0, 0, 0), True, "nm"),
     ]
     with tempfile.TemporaryDirectory(prefix="rustima-r-python-") as tmp:
         tmp = Path(tmp)

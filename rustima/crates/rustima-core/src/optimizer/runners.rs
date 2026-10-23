@@ -1,9 +1,10 @@
 //! Optimizer runners (BFGS, L-BFGS, L-BFGS-B, Nelder-Mead) and gradient helpers.
 
-use argmin::core::{Executor, State, TerminationReason};
-use argmin::solver::linesearch::MoreThuenteLineSearch;
-use argmin::solver::neldermead::NelderMead;
-use argmin::solver::quasinewton::{BFGS, LBFGS};
+use basin::core::math::DenseMatrix;
+use basin::{
+    Bfgs, CostFunction, Executor, FirstOrderState, Lbfgs, MoreThuente, NelderMead,
+    OptimizationResult, SimplexProgress, State, Termination,
+};
 
 use crate::error::SarimaxError;
 use crate::types::SarimaxConfig;
@@ -15,93 +16,59 @@ use super::DIAG_PRECOND_SCALE;
 // L-BFGS optimization
 // ---------------------------------------------------------------------------
 
-/// Run argmin BFGS (full-Hessian) with MoreThuente line search.
-///
-/// Outcome of a single optimizer run: `(params, cost, n_iter, converged)`.
+/// Outcome of a single optimizer run: `(params, cost, iterations, converged)`.
 pub(super) type RunOutcome = std::result::Result<(Vec<f64>, f64, u64, bool), String>;
 
-/// A `RunOutcome` tagged with the method string that produced it:
-/// `(params, cost, n_iter, converged, method)`.
+/// A single-run outcome tagged with the method that produced it.
 pub(super) type MethodOutcome =
     std::result::Result<(Vec<f64>, f64, u64, bool, String), SarimaxError>;
 
-/// Compared to L-BFGS: keeps full n×n Hessian approximation (no limited memory)
-/// → first-iteration step is curvature-aware as the BFGS update accumulates,
-/// reducing the chance of large overshoots in high-magnitude dimensions like
-/// exog coefficients. Closer in behavior to R's `optim(method='BFGS')`.
+fn basin_outcome<S: State<Param = Vec<f64>, Float = f64>>(
+    result: OptimizationResult<S>,
+) -> RunOutcome {
+    if let Termination::Failed(reason) = &result.report.termination {
+        return Err(format!("Basin solver failed: {reason:?}"));
+    }
+    if !result.best_cost().is_finite() {
+        return Err("Basin solver found no finite objective value".into());
+    }
+    Ok((
+        result.best_param().clone(),
+        result.best_cost(),
+        result.iter(),
+        result.report.termination.is_converged(),
+    ))
+}
+
 pub(super) fn run_bfgs(
     objective: SarimaxObjective,
     init_params: Vec<f64>,
     maxiter: u64,
 ) -> RunOutcome {
     let n = init_params.len();
-    let linesearch = MoreThuenteLineSearch::new();
-    let solver = BFGS::new(linesearch)
-        .with_tolerance_grad(1e-5)
-        .map_err(|e| e.to_string())?
-        .with_tolerance_cost(1e-9)
-        .map_err(|e| e.to_string())?;
-
-    // Diagonal preconditioning: inv_H_0 = c · diag(1 / |∇f_i|).
-    //
-    // Without preconditioning, BFGS starts with inv_H = I and the line search
-    // picks α based on the largest-gradient dimension. For SARIMAX, the ARMA
-    // coefficients can have |∇f| ~ 25,000 while exog coefficients have |∇f| < 5.
-    // The resulting α is "right" for ARMA dims (Monahan/Jones transform clamps
-    // any overshoot) but completely wrong for unbounded exog dims, which drift
-    // far from their start values in a single line-search probe and never
-    // recover (the basin we land in has the wrong ta sign — see analysis at
-    // https://en.wikipedia.org/wiki/Limited-memory_BFGS#Scaling).
-    //
-    // Preconditioning with `1/|∇f_i|` per dim makes the first step
-    // approximately ±c in every dimension simultaneously, regardless of
-    // gradient magnitude. The line search then chooses α relative to *all*
-    // dims, not just the steepest. Choice of c=0.1 is conservative: small
-    // enough to keep first-step exog moves bounded, large enough for ARMA
-    // dims to make meaningful progress before BFGS curvature kicks in.
-    // Reference: Nocedal & Wright (2006) §6.4 — Numerical Optimization.
     let grad0 = objective
         .analytical_gradient_negloglike(&init_params)
-        .unwrap_or_else(|_| vec![1.0; n]);
-    let c_precond = DIAG_PRECOND_SCALE;
-    let init_hessian: Vec<Vec<f64>> = (0..n)
-        .map(|i| {
-            (0..n)
-                .map(|j| {
-                    if i == j {
-                        c_precond / grad0[i].abs().max(1e-3)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    let result = Executor::new(objective, solver)
-        .configure(
-            |state: argmin::core::IterState<Vec<f64>, Vec<f64>, (), Vec<Vec<f64>>, (), f64>| {
-                state
-                    .param(init_params)
-                    .inv_hessian(init_hessian)
-                    .max_iters(maxiter)
-            },
-        )
+        .ok()
+        .filter(|g| g.len() == n && g.iter().all(|v| v.is_finite()))
+        .unwrap_or_else(|| vec![1.0; n]);
+    // Retain diagonal preconditioning so high ARMA gradients do not send
+    // unbounded regression coefficients far from their starting values.
+    let initial_inverse = DenseMatrix::from_fn(n, n, |i, j| {
+        if i == j {
+            DIAG_PRECOND_SCALE / grad0[i].abs().max(1e-3)
+        } else {
+            0.0
+        }
+    });
+    let solver = Bfgs::with_line_search(MoreThuente::new())
+        .with_initial_inverse_hessian(initial_inverse)
+        .with_absolute_gradient_tolerance(1e-5)
+        .with_absolute_cost_change_tolerance(1e-9);
+    let result = Executor::new(objective, solver, FirstOrderState::new(init_params))
+        .max_iter(maxiter)
         .run()
-        .map_err(|e| format!("BFGS failed: {}", e))?;
-
-    let state = result.state();
-    let best_param = state
-        .get_best_param()
-        .ok_or("BFGS: no best parameter found")?
-        .clone();
-    let best_cost = state.get_best_cost();
-    let n_iter = state.get_iter();
-    let term_reason = state.get_termination_reason();
-    let converged = term_reason == Some(&TerminationReason::SolverConverged)
-        || term_reason == Some(&TerminationReason::TargetCostReached);
-
-    Ok((best_param, best_cost, n_iter, converged))
+        .map_err(|e| format!("Basin BFGS failed: {e}"))?;
+    basin_outcome(result)
 }
 
 /// Central finite-difference gradient with relative step h = eps * (1 + |x_i|).
@@ -154,50 +121,54 @@ pub(super) fn run_lbfgs(
     init_params: Vec<f64>,
     maxiter: u64,
 ) -> RunOutcome {
-    let linesearch = MoreThuenteLineSearch::new();
-    let solver = LBFGS::new(linesearch, 10) // memory=10 (scipy default)
-        .with_tolerance_grad(1e-5) // match scipy pgtol default
-        .map_err(|e| e.to_string())?
-        .with_tolerance_cost(1e-9)
-        .map_err(|e| e.to_string())?;
-
-    let result = Executor::new(objective, solver)
-        .configure(
-            |state: argmin::core::IterState<Vec<f64>, Vec<f64>, (), (), (), f64>| {
-                state.param(init_params).max_iters(maxiter)
-            },
-        )
+    let solver = Lbfgs::new()
+        .unbounded()
+        .with_m_capacity(10)
+        .with_absolute_gradient_tolerance(1e-5)
+        .with_absolute_cost_change_tolerance(1e-9);
+    let result = Executor::new(objective, solver, FirstOrderState::new(init_params))
+        .max_iter(maxiter)
         .run()
-        .map_err(|e| format!("L-BFGS failed: {}", e))?;
-
-    let state = result.state();
-    let best_param = state
-        .get_best_param()
-        .ok_or("L-BFGS: no best parameter found")?
-        .clone();
-    let best_cost = state.get_best_cost();
-    let n_iter = state.get_iter();
-    let term_reason = state.get_termination_reason();
-    let converged = term_reason == Some(&TerminationReason::SolverConverged)
-        || term_reason == Some(&TerminationReason::TargetCostReached);
-
-    Ok((best_param, best_cost, n_iter, converged))
+        .map_err(|e| format!("Basin L-BFGS failed: {e}"))?;
+    basin_outcome(result)
 }
 
 // ---------------------------------------------------------------------------
-// Nelder-Mead fallback
+// Nelder-Mead (also used for CSS initialization and fallback refinement)
 // ---------------------------------------------------------------------------
+
+pub(super) fn run_simplex<P>(
+    objective: P,
+    simplex: Vec<Vec<f64>>,
+    maxiter: u64,
+    tolerance: f64,
+) -> RunOutcome
+where
+    P: CostFunction<Param = Vec<f64>, Output = f64>,
+    P::Error: std::fmt::Display,
+{
+    // Preserve the former cost-standard-deviation stopping rule rather than
+    // adding Basin's independent simplex-size and cost-spread stopping tests.
+    let solver = NelderMead::new()
+        .with_absolute_simplex_size_tolerance(None)
+        .with_relative_simplex_size_tolerance(None)
+        .with_absolute_simplex_cost_tolerance(None)
+        .with_relative_simplex_cost_tolerance(None)
+        .with_absolute_simplex_cost_std_dev_tolerance(tolerance);
+    let result = Executor::new(objective, solver, SimplexProgress::from_simplex(simplex))
+        .max_iter(maxiter)
+        .run()
+        .map_err(|e| format!("Basin Nelder-Mead failed: {e}"))?;
+    basin_outcome(result)
+}
 
 pub(super) fn run_nelder_mead(
     objective: SarimaxObjective,
     init_params: Vec<f64>,
     maxiter: u64,
 ) -> RunOutcome {
-    let n = init_params.len();
-
-    // Build simplex: n+1 vertices
     let mut simplex = vec![init_params.clone()];
-    for i in 0..n {
+    for i in 0..init_params.len() {
         let mut vertex = init_params.clone();
         let delta = if vertex[i].abs() > 1e-8 {
             vertex[i] * 0.05
@@ -207,32 +178,7 @@ pub(super) fn run_nelder_mead(
         vertex[i] += delta;
         simplex.push(vertex);
     }
-
-    let solver = NelderMead::new(simplex)
-        .with_sd_tolerance(1e-6)
-        .map_err(|e| e.to_string())?;
-
-    let result = Executor::new(objective, solver)
-        .configure(
-            |state: argmin::core::IterState<Vec<f64>, (), (), (), (), f64>| {
-                state.max_iters(maxiter)
-            },
-        )
-        .run()
-        .map_err(|e| format!("Nelder-Mead failed: {}", e))?;
-
-    let state = result.state();
-    let best_param = state
-        .get_best_param()
-        .ok_or("Nelder-Mead: no best parameter found")?
-        .clone();
-    let best_cost = state.get_best_cost();
-    let n_iter = state.get_iter();
-    let term_reason = state.get_termination_reason();
-    let converged = term_reason == Some(&TerminationReason::SolverConverged)
-        || term_reason == Some(&TerminationReason::TargetCostReached);
-
-    Ok((best_param, best_cost, n_iter, converged))
+    run_simplex(objective, simplex, maxiter, 1e-6)
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +318,21 @@ pub(super) fn consume_budget(remaining: &mut u64, total_work: &mut u64, n: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simplex_without_a_finite_candidate_returns_an_error() {
+        struct Invalid;
+        impl CostFunction for Invalid {
+            type Param = Vec<f64>;
+            type Output = f64;
+            type Error = std::convert::Infallible;
+            fn cost(&self, _: &Vec<f64>) -> Result<f64, Self::Error> {
+                Ok(f64::INFINITY)
+            }
+        }
+        let result = run_simplex(Invalid, vec![vec![0.0], vec![0.1]], 1, 1e-6);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn numerical_gradient_recovers_from_invalid_analytical_gradient() {

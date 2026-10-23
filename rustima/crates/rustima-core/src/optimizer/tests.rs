@@ -1,7 +1,7 @@
 use super::*;
 use super::objective::SarimaxObjective;
 use super::trust_region::refine_exog_brent;
-use argmin::core::{CostFunction, Gradient};
+use basin::{CostFunction, Gradient};
 use crate::kalman::kalman_filter;
 use crate::params::SarimaxParams;
 use crate::test_helpers::{load_fixtures, make_config_with_enforcement};
@@ -49,8 +49,10 @@ fn test_objective_finite() {
         ss_cache: RefCell::new(None),
     };
 
-    let cost = obj.cost(&vec![0.5]).unwrap();
+    let cost = obj.cost(&vec![0.5, 0.0]).unwrap();
     assert!(cost.is_finite(), "cost should be finite: {}", cost);
+    assert_eq!(obj.cost(&vec![0.5]).unwrap(), f64::INFINITY);
+    assert_eq!(obj.cost(&vec![f64::NAN, 0.0]).unwrap(), f64::INFINITY);
 }
 
 #[test]
@@ -213,8 +215,10 @@ fn test_gradient_finite() {
         ss_cache: RefCell::new(None),
     };
 
-    let grad = obj.gradient(&vec![0.5]).unwrap();
-    assert_eq!(grad.len(), 1);
+    let grad = obj.gradient(&vec![0.5, 0.0]).unwrap();
+    assert_eq!(grad.len(), 2);
+    assert!(grad.iter().all(|v| v.is_finite()));
+    assert!(grad.iter().any(|v| v.abs() > 1e-6));
     assert!(
         grad[0].is_finite(),
         "gradient should be finite: {}",

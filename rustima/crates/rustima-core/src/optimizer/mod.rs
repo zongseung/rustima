@@ -1,12 +1,9 @@
-//! SARIMAX parameter optimization with optional Basin L-BFGS-B support.
+//! SARIMAX parameter optimization with Basin solvers and custom trust-region methods.
 //!
 //! This module provides:
 //! - Parameter space transformations (constrained ↔ unconstrained)
 //! - Negative log-likelihood objectives shared by optimization backends
 //! - `fit()` function: the main entry point for model fitting
-
-use argmin::core::{Executor, State};
-use argmin::solver::neldermead::NelderMead;
 
 use std::cell::RefCell;
 
@@ -35,7 +32,7 @@ mod trust_region;
 
 use lbfgsb::parse_method;
 use multistart::{
-    compute_n_restarts, fit_bfgs_single, fit_lbfgs_argmin, fit_lbfgsb_adaptive_restart,
+    compute_n_restarts, fit_bfgs_single, fit_lbfgs_multi, fit_lbfgsb_adaptive_restart,
     fit_lbfgsb_hybrid, fit_lbfgsb_multi, fit_lbfgsb_single,
 };
 use objective::{CssObjective, SarimaxObjective};
@@ -553,18 +550,7 @@ fn run_nm_css(
         simplex.push(vertex);
     }
 
-    let solver = NelderMead::new(simplex).with_sd_tolerance(1e-4).ok()?;
-
-    let result = Executor::new(obj, solver)
-        .configure(
-            |state: argmin::core::IterState<Vec<f64>, (), (), (), (), f64>| {
-                state.max_iters(maxiter)
-            },
-        )
-        .run()
-        .ok()?;
-
-    let best_unconstrained = result.state().get_best_param()?.clone();
+    let (best_unconstrained, _, _, _) = runners::run_simplex(obj, simplex, maxiter, 1e-4).ok()?;
     transform_params(&best_unconstrained, config).ok()
 }
 
@@ -770,7 +756,7 @@ pub fn fit(
             n_restarts,
         )
         .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
-        "lbfgs" => fit_lbfgs_argmin(
+        "lbfgs" => fit_lbfgs_multi(
             &objective,
             &unconstrained_start,
             config,

@@ -165,7 +165,7 @@ pub struct FitResult {
     pub n_params: usize,
     /// Total optimizer work units consumed.
     ///
-    /// - **L-BFGS / Nelder-Mead** (argmin): solver iterations (`state.get_iter()`).
+    /// - **BFGS / L-BFGS / Nelder-Mead** (Basin): completed solver iterations.
     /// - **L-BFGS-B** (Basin): objective/gradient evaluations, including line search.
     ///   This counts work rather than accepted optimizer steps.
     /// - **Multi-start methods** (`lbfgsb-multi`, `lbfgs`): cumulative sum across all

@@ -12,10 +12,14 @@ See the [project overview](../README.md) or [Korean guide](../README_ko.md).
 | `tools/build_r_package.py` | Assemble a standalone R source package |
 | `benchmarks/` | Performance experiments |
 
-Basin 3.0 is the required L-BFGS-B implementation. The vendored C solver and
+Basin 3.0 provides L-BFGS-B, L-BFGS, BFGS and Nelder-Mead. The vendored C solver and
 its build script have been removed. Existing `lbfgsb*` names and `basin-lbfgsb*`
 aliases both select Basin. Trust-region and profile-trust-region remain shared
 Rust implementations.
+
+`lbfgs`, `bfgs` and `nm` keep their existing API names. Their solver iterations,
+BFGS diagonal preconditioning and initial simplex construction are preserved;
+`argmin` and `argmin-math` are no longer dependencies.
 
 From this directory, with Rust >= 1.87:
 

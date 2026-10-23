@@ -32,10 +32,11 @@ sarimax_loglike(y, params, order, seasonal = NULL, xreg = NULL,
 with \code{order} and \code{period}.}
 \item{xreg}{Optional finite numeric matrix, with one row per observation.}
 \item{optimizer}{Optimizer name. The default \code{"lbfgsb"} and
-\code{"basin-lbfgsb"} use Basin 3.0. Other methods include \code{"trust-region"},
-\code{"profile-trust-region"}, \code{"lbfgs"}, and \code{"nm"}.}
+\code{"basin-lbfgsb"} use Basin 3.0, as do \code{"lbfgs"}, \code{"bfgs"} and
+\code{"nm"}. Custom methods are \code{"trust-region"} and \code{"profile-trust-region"}.}
 \item{maxiter}{Nonnegative optimizer work budget. For L-BFGS-B this counts
-objective/gradient evaluations, including line search, rather than accepted steps.}
+objective/gradient evaluations, including line search, rather than accepted steps.
+For L-BFGS, BFGS and Nelder-Mead it counts completed solver iterations.}
 \item{start_params}{Optional constrained parameter vector in the order described below.}
 \item{trend}{\code{"n"} (none), \code{"c"} (constant), \code{"t"} (linear), or \code{"ct"} (both).}
 \item{enforce_stationarity, enforce_invertibility}{Logical constraint flags.}
