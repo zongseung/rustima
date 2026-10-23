@@ -3,13 +3,16 @@
 All notable changes to rustima are documented here.
 Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
-## Unreleased
+## 0.4.0rc1 — distribution preparation
 
-- Add an optional Basin 3.0.0 L-BFGS-B backend, selected with
-  `method="basin-lbfgsb"` and its strict, multi-start, adaptive, and hybrid
-  variants. Include numerical comparisons, convergence checks, and benchmarks.
-- Correct the minimum Rust version to 1.87, matching the existing nalgebra
-  dependency, and test both optimizer backends on that toolchain.
+- Separate the shared `rustima-core`, Python package and R package directories.
+- Use Basin 3.0 for all L-BFGS-B fits, retaining existing method names and Basin
+  aliases. Remove the vendored C solver, FFI wrappers and C build script.
+- Add an R 0.1.0 preview through extendr: fixed-order fits, likelihoods, S3
+  forecasts, independent batch fits and explicit candidate grid search.
+- Bundle locked Rust dependencies and the shared core in an offline-installable
+  R source archive. Separate Python `py-v*` and R `r-v*` release workflows.
+- Keep Python's existing high-level API and numerical reference suite.
 
 ## 0.3.0 — 2026-07-25
 

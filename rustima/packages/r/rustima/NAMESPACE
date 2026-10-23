@@ -1,0 +1,8 @@
+useDynLib(rustima, .registration=TRUE)
+export(sarimax, sarimax_loglike, sarimax_batch, sarimax_grid_search, rustima_backend_info)
+S3method(coef,rustima_fit)
+S3method(logLik,rustima_fit)
+S3method(nobs,rustima_fit)
+S3method(print,rustima_fit)
+S3method(predict,rustima_fit)
+importFrom(stats,coef,logLik,nobs,predict)

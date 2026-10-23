@@ -38,12 +38,12 @@ jobs:
       - name: Build wheel and install
         run: |
           uv pip install maturin
-          CARGO_TARGET_DIR=target_wheel uv run maturin build --out /tmp/wheels
+          CARGO_TARGET_DIR=target_wheel uv run --no-project --no-sync maturin build --manifest-path packages/python/Cargo.toml --out /tmp/wheels
           uv pip install --force-reinstall /tmp/wheels/rustima-*.whl
 
       - name: Run Tier B nightly tests
         # Tier B는 test_matrix_tier_a.py 로 통합됨 (@nightly 마커, 커밋 a903551)
-        run: .venv/bin/python -m pytest python_tests/test_matrix_tier_a.py -m nightly -v --tb=short
+        run: .venv/bin/python -m pytest packages/python/tests/test_matrix_tier_a.py -m nightly -v --tb=short
 
   benchmark:
     name: Performance Benchmark
@@ -70,11 +70,11 @@ jobs:
       - name: Build wheel (release) and install
         run: |
           uv pip install maturin
-          CARGO_TARGET_DIR=target_wheel uv run maturin build --release --out /tmp/wheels
+          CARGO_TARGET_DIR=target_wheel uv run --no-project --no-sync maturin build --manifest-path packages/python/Cargo.toml --release --out /tmp/wheels
           uv pip install --force-reinstall /tmp/wheels/rustima-*.whl
 
       - name: Run Rust benchmarks
-        run: cargo bench --bench bench_fit -- --output-format bencher | tee bench_results.txt
+        run: cargo bench -p rustima-core --bench bench_fit -- --output-format bencher | tee bench_results.txt
 
       - name: Run Python benchmark comparison
         # 벤치 스크립트는 benchmarks/ 로 격리됨

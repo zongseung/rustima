@@ -1,0 +1,4 @@
+^src/rust/target$
+^src/[.]cargo$
+^src/vendor$
+^README[.]md$

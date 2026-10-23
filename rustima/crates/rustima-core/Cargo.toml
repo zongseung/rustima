@@ -1,0 +1,30 @@
+[package]
+name = "rustima-core"
+version = "0.4.0-rc.1"
+edition = "2021"
+rust-version = "1.87"
+description = "Shared SARIMAX engine for Python and R"
+repository = "https://github.com/zongseung/rustima"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+nalgebra = "0.34"
+argmin = "0.11"
+argmin-math = { version = "0.5", features = ["nalgebra_latest", "vec"] }
+basin = { version = "=3.0.0", default-features = false }
+statrs = "0.18"
+rayon = "1.10"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+approx = "0.5"
+
+[[bench]]
+name = "bench_kalman"
+harness = false
+
+[[bench]]
+name = "bench_fit"
+harness = false
