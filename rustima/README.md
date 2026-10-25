@@ -33,8 +33,8 @@ python -m pytest packages/python/tests -o pythonpath=
 
 # R >= 4.2, Cargo/rustc and the platform's R build tools must be installed.
 python3 tools/build_r_package.py
-R CMD INSTALL dist/r/rustima_0.1.0.tar.gz
-R CMD check --no-manual --as-cran dist/r/rustima_0.1.0.tar.gz
+R CMD INSTALL dist/r/rustima_0.1.1.tar.gz
+R CMD check --no-manual --as-cran dist/r/rustima_0.1.1.tar.gz
 ```
 
 The R builder copies the shared core into a staging directory and vendors the
@@ -43,7 +43,7 @@ and `--locked` options. Installing the raw `packages/r/rustima` directory is not
 supported; build the archive first. Python and R use the same core source; no
 second hand-maintained engine is kept under the R package.
 
-Release candidate tags use `py-v0.4.0-rc.1` and `r-v0.1.0-rc.1`.
+Release candidate tags follow `py-v<VERSION>-rc.<N>` and `r-v<VERSION>-rc.<N>`.
 Python tags trigger wheel/sdist builds; R tags trigger source builds and R checks.
 R tags never invoke the PyPI publication workflow. A CRAN submission remains a
 separate maintainer action after platform checks pass.

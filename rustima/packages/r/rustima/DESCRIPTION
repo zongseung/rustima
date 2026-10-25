@@ -1,6 +1,6 @@
 Package: rustima
 Title: Seasonal ARIMA Models Powered by Rust
-Version: 0.1.0
+Version: 0.1.1
 Authors@R: person("zongseung", email = "new9279@gachon.ac.kr", role = c("aut", "cre"))
 Description: Fits seasonal autoregressive integrated moving average models
     with optional regression terms using a shared Rust engine. Provides
