@@ -13,7 +13,7 @@ Kalman likelihoods, fits seasonal models with optional regression terms, and
 forecasts with prediction intervals. Independent series and explicit order
 candidates can be fitted in parallel with Rayon.
 
-The upcoming Python `0.4.0rc2` and R `0.1.1` preview share one Rust core.
+Python `0.4.0` and the R `0.1.1` preview share one Rust core.
 L-BFGS-B (default), L-BFGS, BFGS and Nelder-Mead use **Basin 3.0**. The previous
 vendored C optimizer is removed; `lbfgsb` and `basin-lbfgsb` select the same
 backend. Trust-region and profile-trust-region remain rustima implementations.
