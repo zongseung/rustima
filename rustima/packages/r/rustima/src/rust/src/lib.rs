@@ -1,6 +1,7 @@
 use extendr_api::prelude::*;
 use extendr_api::Result;
 use rustima_core::{
+    auto::{self, Criterion, SearchOptions},
     batch, forecast, optimizer,
     params::SarimaxParams,
     pipeline,
@@ -75,9 +76,6 @@ fn fit_list(f: FitResult) -> List {
 }
 
 fn check_params(params: &[f64], c: &SarimaxConfig) -> Result<SarimaxParams> {
-    if params.iter().any(|x| !x.is_finite()) {
-        return Err(error("params must be finite"));
-    }
     SarimaxParams::from_flat(params, c).map_err(error)
 }
 
@@ -119,11 +117,8 @@ fn engine_fit(
         Nullable::Null => None,
         Nullable::NotNull(v) => Some(v),
     };
-    if start
-        .as_ref()
-        .is_some_and(|v| v.iter().any(|x| !x.is_finite()))
-    {
-        return Err(error("start_params must be finite"));
+    if let Some(start) = &start {
+        validation::validate_finite(start, "start_params").map_err(error)?;
     }
     optimizer::fit(
         &y,
@@ -158,27 +153,16 @@ fn engine_forecast(
     alpha: f64,
     future: List,
 ) -> Result<List> {
-    if !(0..=10_000).contains(&n_ahead) {
-        return Err(error("n.ahead must be between 0 and 10000"));
-    }
-    if !alpha.is_finite() || alpha <= 0.0 || alpha >= 1.0 {
-        return Err(error("alpha must be in (0, 1)"));
-    }
+    let steps = usize::try_from(n_ahead).map_err(error)?;
+    validation::validate_steps(steps).map_err(error)?;
+    validation::validate_alpha(alpha).map_err(error)?;
     let x = columns(xreg)?;
     let c = config(&spec, x.as_ref().map_or(0, Vec::len))?;
     validation::validate_request(&y, &c, x.as_deref()).map_err(error)?;
     let p = check_params(&params, &c)?;
     let future = columns(future)?;
-    let f = forecast::forecast_pipeline(
-        &y,
-        &c,
-        &p,
-        n_ahead as usize,
-        alpha,
-        x.as_deref(),
-        future.as_deref(),
-    )
-    .map_err(error)?;
+    let f = forecast::forecast_pipeline(&y, &c, &p, steps, alpha, x.as_deref(), future.as_deref())
+        .map_err(error)?;
     Ok(list!(
         pred = f.mean,
         se = f.variance.iter().map(|v| v.sqrt()).collect::<Vec<_>>(),
@@ -266,6 +250,93 @@ fn engine_grid(
     })))
 }
 
+#[extendr]
+fn engine_auto(
+    y: Vec<f64>,
+    spec: List,
+    xreg: List,
+    max_order: Vec<i32>,
+    max_seasonal: Vec<i32>,
+    d: i32,
+    dd: i32,
+    criterion: &str,
+    stepwise: bool,
+    optimizer: &str,
+    maxiter: i32,
+    nthreads: i32,
+) -> Result<List> {
+    if max_order.len() != 3 || max_seasonal.len() != 4 || d < -1 || dd < -1 || maxiter < 0 {
+        return Err(error("invalid Auto ARIMA bounds or iteration limit"));
+    }
+    let order = max_order
+        .into_iter()
+        .map(usize::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(error)?;
+    let seasonal = max_seasonal
+        .into_iter()
+        .map(usize::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(error)?;
+    let options = SearchOptions {
+        max_p: order[0],
+        max_d: order[1],
+        max_q: order[2],
+        max_pp: seasonal[0],
+        max_dd: seasonal[1],
+        max_qq: seasonal[2],
+        period: seasonal[3],
+        d: (d >= 0).then_some(d as usize),
+        dd: (dd >= 0).then_some(dd as usize),
+        stepwise,
+        criterion: Criterion::parse(criterion).map_err(error)?,
+    };
+    let x = columns(xreg)?;
+    let config = config(&spec, x.as_ref().map_or(0, Vec::len))?;
+    let method = if optimizer.is_empty() {
+        None
+    } else {
+        Some(optimizer)
+    };
+    let result = pool(nthreads)?
+        .install(|| {
+            auto::search(
+                &y,
+                &config,
+                &options,
+                method,
+                Some(maxiter as u64),
+                x.as_deref(),
+            )
+        })
+        .map_err(error)?;
+    let best = result.best.map(|best| {
+        let o = best.order;
+        list!(
+            fit = fit_list(best.fit),
+            order = vec![o.p as i32, o.d as i32, o.q as i32],
+            seasonal = vec![o.pp as i32, o.dd as i32, o.qq as i32, o.s as i32]
+        )
+    });
+    let history = List::from_values(result.history.into_iter().map(|item| {
+        let o = item.order;
+        list!(
+            order = vec![o.p as i32, o.d as i32, o.q as i32],
+            seasonal_order = vec![o.pp as i32, o.dd as i32, o.qq as i32, o.s as i32],
+            ic = item.ic.unwrap_or(f64::NAN),
+            converged = item.converged,
+            error = item.error,
+            warnings = item.warnings
+        )
+    }));
+    Ok(list!(
+        best = Nullable::from(best),
+        history = history,
+        d = result.d as i32,
+        D = result.dd as i32
+    ))
+}
+
 extendr_module! {
     mod rustima;
     fn engine_info;
@@ -274,4 +345,5 @@ extendr_module! {
     fn engine_forecast;
     fn engine_batch;
     fn engine_grid;
+    fn engine_auto;
 }

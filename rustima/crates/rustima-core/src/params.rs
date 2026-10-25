@@ -25,6 +25,7 @@ pub struct SarimaxParams {
 impl SarimaxParams {
     /// Unpack a flat parameter vector into structured fields.
     pub fn from_flat(flat: &[f64], config: &SarimaxConfig) -> Result<Self> {
+        crate::validation::validate_finite(flat, "params")?;
         let kt = config.trend.k_trend();
         let n_exog = config.n_exog;
         let p = config.order.p;

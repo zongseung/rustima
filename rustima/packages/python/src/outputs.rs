@@ -9,6 +9,18 @@ pub(super) fn fit_result_to_pydict<'py>(
     py: Python<'py>,
     result: &rustima_core::types::FitResult,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let dict = fit_result_dict(py, result)?;
+    for msg in &result.warnings {
+        py.import("warnings")?
+            .call_method1("warn", (msg.as_str(),))?;
+    }
+    Ok(dict)
+}
+
+pub(super) fn fit_result_dict<'py>(
+    py: Python<'py>,
+    result: &rustima_core::types::FitResult,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("params", &result.params)?;
     dict.set_item("loglike", result.loglike)?;
@@ -21,12 +33,6 @@ pub(super) fn fit_result_to_pydict<'py>(
     dict.set_item("converged", result.converged)?;
     dict.set_item("method", &result.method)?;
     dict.set_item("warnings", &result.warnings)?;
-
-    // Emit warnings via Python warnings module
-    for msg in &result.warnings {
-        let warn_mod = py.import("warnings")?;
-        warn_mod.call_method1("warn", (msg.as_str(),))?;
-    }
 
     Ok(dict)
 }

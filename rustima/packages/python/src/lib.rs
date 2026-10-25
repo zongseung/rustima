@@ -1,3 +1,4 @@
+mod auto;
 mod batch;
 mod inputs;
 mod outputs;
@@ -14,6 +15,8 @@ fn version() -> &'static str {
 /// Python module definition.
 #[pymodule]
 fn rustima(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(auto::_auto_arima, m)?)?;
+    m.add_function(wrap_pyfunction!(auto::_difference_orders, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(single::sarimax_loglike, m)?)?;
     m.add_function(wrap_pyfunction!(single::sarimax_fit, m)?)?;

@@ -78,6 +78,7 @@ pub fn compute_inference(
     alpha: f64,
     exog: Option<&[Vec<f64>]>,
 ) -> Result<InferenceResult> {
+    crate::validation::validate_alpha(alpha)?;
     let k = constrained_params.len();
     if k == 0 {
         return Ok(InferenceResult {

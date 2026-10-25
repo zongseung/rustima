@@ -32,26 +32,15 @@ fn parse_exog(exog: Option<&PyReadonlyArray2<f64>>) -> (Option<Vec<Vec<f64>>>, u
 
 pub(super) fn validate_finite_cols(cols: &[Vec<f64>], input_name: &str) -> PyResult<()> {
     for (j, col) in cols.iter().enumerate() {
-        for (t, v) in col.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "{} contains NaN or Inf at column {}, row {}",
-                    input_name, j, t
-                )));
-            }
-        }
+        rustima_core::validation::validate_finite(col, input_name)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e} (column {j})")))?;
     }
     Ok(())
 }
 
 /// Validate that a 1D endog slice contains no NaN/Inf values.
 fn validate_endog_finite(endog: &[f64]) -> PyResult<()> {
-    if endog.iter().any(|v| !v.is_finite()) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "input time series contains NaN or Inf values",
-        ));
-    }
-    Ok(())
+    rustima_core::validation::validate_endog(endog).map_err(to_pyerr)
 }
 
 /// Validate that each series in a batch contains no NaN/Inf values.
@@ -59,12 +48,9 @@ fn validate_batch_finite(series_list: &[PyReadonlyArray1<'_, f64>]) -> PyResult<
     let mut result = Vec::with_capacity(series_list.len());
     for (i, s) in series_list.iter().enumerate() {
         let sl = s.as_slice()?;
-        if sl.iter().any(|v| !v.is_finite()) {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "input time series at index {} contains NaN or Inf values",
-                i
-            )));
-        }
+        rustima_core::validation::validate_finite(sl, "input time series").map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("series at index {i}: {e}"))
+        })?;
         result.push(sl.to_vec());
     }
     Ok(result)
@@ -283,6 +269,8 @@ pub(super) fn prepare_single_request(
     let (pp, dd, qq, s) = seasonal;
     validate_order(p, d, q, pp, dd, qq, s, n_exog)?;
     let config = build_config(order, seasonal, n_exog, flags, parse_trend(trend)?);
+    rustima_core::validation::validate_request(endog, &config, exog_cols.as_deref())
+        .map_err(to_pyerr)?;
     Ok((config, exog_cols))
 }
 
@@ -312,22 +300,10 @@ pub(super) fn prepare_batch_request(
 
 /// Validate that alpha is in the open interval (0, 1).
 pub(super) fn validate_alpha(alpha: f64) -> PyResult<()> {
-    if alpha <= 0.0 || alpha >= 1.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "alpha must be in (0, 1), got {}",
-            alpha
-        )));
-    }
-    Ok(())
+    rustima_core::validation::validate_alpha(alpha).map_err(to_pyerr)
 }
 
 /// Validate that forecast steps do not exceed the maximum.
 pub(super) fn validate_steps(steps: usize) -> PyResult<()> {
-    if steps > 10_000 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "steps must be <= 10000, got {}",
-            steps
-        )));
-    }
-    Ok(())
+    rustima_core::validation::validate_steps(steps).map_err(to_pyerr)
 }

@@ -22,4 +22,16 @@ predict(fit, 12)$pred
 ```
 
 See `?sarimax`, `?sarimax_batch`, and `?rustima_backend_info` after installation.
-The initial API includes explicit grid candidates, not stepwise Auto ARIMA.
+Auto ARIMA uses the shared Rust engine for ADF differencing, seasonal variance-ratio
+differencing, stepwise/grid candidate fitting, and final model selection:
+
+```r
+selected <- auto_arima(AirPassengers, s = 12, max_p = 2, max_q = 2,
+                       max_P = 1, max_Q = 1, nthreads = 2)
+selected$result$spec
+predict(selected, n.ahead = 12)$pred
+```
+
+Set `d` and `D` explicitly to bypass differencing selection. The seasonal period
+defaults to zero; it is not inferred from `ts`. This is rustima's search policy,
+not the complete `forecast::auto.arima` API. `trace` prints after search completes.

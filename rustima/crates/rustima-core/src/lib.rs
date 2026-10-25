@@ -1,3 +1,4 @@
+pub mod auto;
 pub mod batch;
 pub mod css;
 pub mod error;

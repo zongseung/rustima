@@ -41,13 +41,16 @@ result = SARIMAXModel(y, order=(1, 0, 1)).fit()
 print(result.params, result.aic)
 print(result.forecast(5))
 
-selected = auto_arima(y, seasonal=False)
+selected = auto_arima(y, s=0)
 print(selected.order)
 ```
 
 Python also supports exogenous regressors, inference, diagnostics, rolling
 forecasts, batch fitting and stepwise/grid Auto ARIMA. See the
 [Python package](rustima/packages/python/README.md) and its tests for examples.
+Auto ARIMA now selects differences in Rust using ADF and the seasonal variance
+ratio, independently of whether statsmodels is installed. Search traces print
+after the Rust call returns.
 
 ## R preview
 
@@ -76,12 +79,14 @@ predict(fit, n.ahead = 5)$pred
 
 fits <- sarimax_batch(list(y, y), c(1, 0, 0), nthreads = 2)
 grid <- sarimax_grid_search(y, list(c(1, 0, 0), c(2, 0, 0)), nthreads = 2)
+selected <- auto_arima(y, max_p = 2, max_q = 2, nthreads = 2)
+predict(selected, n.ahead = 5)$pred
 rustima_backend_info()
 ```
 
-R currently exposes fixed-order fitting, likelihood evaluation, forecasts,
-batch fits and explicit paired order candidates. Automatic differencing and
-stepwise Auto ARIMA remain Python features in this preview. Check each fit's
+R exposes fixed-order fitting, likelihood evaluation, forecasts, batch fits,
+explicit paired order candidates, and stepwise/grid Auto ARIMA. Python and R
+share Rust differencing selection and candidate search. Check each selected fit's
 `converged` and `warnings` fields. Missing and nonfinite observations are rejected.
 
 ## Repository and releases
@@ -89,6 +94,7 @@ stepwise Auto ARIMA remain Python features in this preview. Check each fit's
 ```text
 rustima/
   crates/rustima-core/       shared statistical engine
+    tests/fixtures/         self-contained core test references
   packages/python/          Python binding and package
   packages/r/rustima/        R binding and package
   tests/fixtures/            numerical reference data

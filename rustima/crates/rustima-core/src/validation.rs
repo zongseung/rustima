@@ -1,6 +1,40 @@
 use crate::error::{Result, SarimaxError};
 use crate::types::SarimaxConfig;
 
+pub fn validate_finite(values: &[f64], name: &str) -> Result<()> {
+    if let Some(i) = values.iter().position(|x| !x.is_finite()) {
+        return Err(SarimaxError::InvalidInput(format!(
+            "{name} contains NaN or Inf at index {i}; values must be finite"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_endog(y: &[f64]) -> Result<()> {
+    if y.is_empty() {
+        return Err(SarimaxError::InvalidInput("y must be nonempty".into()));
+    }
+    validate_finite(y, "y")
+}
+
+pub fn validate_alpha(alpha: f64) -> Result<()> {
+    if !alpha.is_finite() || alpha <= 0.0 || alpha >= 1.0 {
+        return Err(SarimaxError::InvalidInput(format!(
+            "alpha must be in (0, 1), got {alpha}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_steps(steps: usize) -> Result<()> {
+    if steps > 10_000 {
+        return Err(SarimaxError::InvalidInput(format!(
+            "steps must be <= 10000, got {steps}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_request(
     y: &[f64],
     config: &SarimaxConfig,
@@ -8,11 +42,7 @@ pub fn validate_request(
 ) -> Result<()> {
     let o = &config.order;
     validate_order(o.p, o.d, o.q, o.pp, o.dd, o.qq, o.s, config.n_exog)?;
-    if y.is_empty() || y.iter().any(|x| !x.is_finite()) {
-        return Err(SarimaxError::InvalidInput(
-            "y must be nonempty and finite".into(),
-        ));
-    }
+    validate_endog(y)?;
     let cols = exog.unwrap_or(&[]);
     if cols.len() != config.n_exog {
         return Err(SarimaxError::InvalidInput(
@@ -32,6 +62,17 @@ pub fn validate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_nonfinite_probabilities_and_oversized_forecasts() {
+        for alpha in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 1.0, -0.1] {
+            assert!(validate_alpha(alpha).is_err());
+        }
+        assert!(validate_alpha(0.05).is_ok());
+        assert!(validate_steps(0).is_ok());
+        assert!(validate_steps(10_000).is_ok());
+        assert!(validate_steps(10_001).is_err());
+    }
 
     #[test]
     fn rejects_invalid_data_shapes_and_orders() {

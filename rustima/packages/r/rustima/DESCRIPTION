@@ -5,7 +5,8 @@ Authors@R: person("zongseung", email = "new9279@gachon.ac.kr", role = c("aut", "
 Description: Fits seasonal autoregressive integrated moving average models
     with optional regression terms using a shared Rust engine. Provides
     Kalman likelihood evaluation, Basin optimization, forecasting, and
-    independent batch fits without a Python runtime.
+    independent batch fits and automatic ARIMA order selection without a
+    Python runtime.
 License: GPL (>= 3)
 Encoding: UTF-8
 Depends: R (>= 4.2)

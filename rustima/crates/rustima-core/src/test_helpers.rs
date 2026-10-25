@@ -101,10 +101,6 @@ pub fn make_seasonal_params(
 
 /// Load the statsmodels reference fixture JSON.
 pub fn load_fixtures() -> serde_json::Value {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/statsmodels_reference.json"
-    );
-    let data = std::fs::read_to_string(path).expect("fixtures file not found");
-    serde_json::from_str(&data).expect("invalid JSON")
+    serde_json::from_str(include_str!("../tests/fixtures/statsmodels_reference.json"))
+        .expect("invalid JSON")
 }

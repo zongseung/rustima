@@ -89,6 +89,8 @@ pub fn forecast_from_state(
     params: &SarimaxParams,
     n_obs: usize,
 ) -> Result<ForecastResult> {
+    crate::validation::validate_alpha(alpha)?;
+    crate::validation::validate_steps(steps)?;
     // Validate: exog model requires future_exog for forecasting
     if !exog_coeffs.is_empty() && future_exog.is_none() && steps > 0 {
         return Err(SarimaxError::InvalidInput(
@@ -266,6 +268,8 @@ pub fn forecast_pipeline(
     exog: Option<&[Vec<f64>]>,
     future_exog: Option<&[Vec<f64>]>,
 ) -> Result<ForecastResult> {
+    crate::validation::validate_alpha(alpha)?;
+    crate::validation::validate_steps(steps)?;
     if config.simple_differencing {
         // Pre-difference the data
         let eff_endog = apply_differencing(endog, config);
@@ -356,6 +360,8 @@ pub fn rolling_forecast_pipeline(
     alpha: f64,
     exog: Option<&[Vec<f64>]>,
 ) -> Result<RollingForecastOutput> {
+    crate::validation::validate_alpha(alpha)?;
+    crate::validation::validate_steps(horizon)?;
     if config.simple_differencing {
         return Err(SarimaxError::InvalidInput(
             "rolling_forecast does not support simple_differencing yet".into(),
