@@ -5,6 +5,8 @@ Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
 ## Unreleased
 
+## 0.4.0rc2 — shared core and validation fixes
+
 - Fix `simple_differencing=True` with exogenous regressors: forecasts now difference
   the future exog like the fitted regressors (they were used in levels), and OPG
   standard errors run on the differenced series with the matching `n_eff`. A new

@@ -11,7 +11,7 @@ Rust로 작성한 SARIMAX 엔진입니다. Python과 R에서 같은 코어의 �
 Kalman 우도·최적화·예측을 호출하며, 외생변수와 Rayon 기반 독립 작업 병렬화를
 지원합니다. 기본 우도를 Whittle 근사로 대체하지 않습니다.
 
-현재 준비 중인 버전은 Python `0.4.0rc1`, R `0.1.0` preview입니다.
+현재 준비 중인 버전은 Python `0.4.0rc2`, R `0.1.1` preview입니다.
 L-BFGS-B(기본)·L-BFGS·BFGS·Nelder-Mead는 **Basin 3.0**을 사용합니다.
 기존 C 최적화 코드와 빌드 스크립트를
 제거했고, `lbfgsb`와 `basin-lbfgsb` 이름을 모두 유지했습니다.
@@ -55,7 +55,7 @@ Windows에서는 Rtools가 필요합니다.
 ```sh
 cd rustima
 python3 tools/build_r_package.py
-R CMD INSTALL dist/r/rustima_0.1.0.tar.gz
+R CMD INSTALL dist/r/rustima_0.1.1.tar.gz
 ```
 
 빌더가 공통 코어와 잠긴 Rust 의존성을 소스 패키지에 묶습니다.

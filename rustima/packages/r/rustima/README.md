@@ -7,8 +7,8 @@ From the `rustima/` workspace directory:
 
 ```sh
 python3 tools/build_r_package.py
-R CMD INSTALL dist/r/rustima_0.1.0.tar.gz
-R CMD check --no-manual --as-cran dist/r/rustima_0.1.0.tar.gz
+R CMD INSTALL dist/r/rustima_0.1.1.tar.gz
+R CMD check --no-manual --as-cran dist/r/rustima_0.1.1.tar.gz
 ```
 
 The builder embeds the shared Rust source and vendors locked dependencies.

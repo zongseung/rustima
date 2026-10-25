@@ -1,7 +1,7 @@
 # rustima for Python
 
 Python bindings for the shared Rust SARIMAX engine. Development version:
-`0.4.0rc1`. L-BFGS-B, L-BFGS, BFGS and Nelder-Mead use Basin 3.0;
+`0.4.0rc2`. L-BFGS-B, L-BFGS, BFGS and Nelder-Mead use Basin 3.0;
 `basin-lbfgsb` remains an alias. Custom trust-region methods remain available.
 
 From the project workspace:

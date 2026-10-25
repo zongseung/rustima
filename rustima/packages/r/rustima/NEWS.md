@@ -1,3 +1,8 @@
+# rustima 0.1.1 (release candidate)
+
+- Reject extra future regressor columns before differencing.
+- Update the bundled Rust core to 0.4.0-rc.2.
+
 # rustima 0.1.0 (release candidate)
 
 - `coef()` returns a named vector (`ar.L1`, `ma.S.L12`, `x1`, `sigma2`, ...).
