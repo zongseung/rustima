@@ -8,9 +8,9 @@ From the project workspace:
 
 ```sh
 uv venv .venv
-uv pip install maturin numpy polars pytest statsmodels scipy pandas
+uv pip install maturin numpy polars pytest
 .venv/bin/maturin develop --release --manifest-path packages/python/Cargo.toml
-.venv/bin/python -m pytest packages/python/tests -o pythonpath= -m "not nightly"
+.venv/bin/python -m pytest packages/python/tests -o pythonpath=
 ```
 
 ```python

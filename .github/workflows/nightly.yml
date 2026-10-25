@@ -13,38 +13,6 @@ defaults:
     working-directory: rustima
 
 jobs:
-  tier-b-tests:
-    name: Tier B Matrix Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: Create venv and install deps
-        run: |
-          uv venv .venv
-          uv pip install numpy pytest statsmodels scipy pandas
-
-      - name: Build wheel and install
-        run: |
-          uv pip install maturin
-          CARGO_TARGET_DIR=target_wheel uv run --no-project --no-sync maturin build --manifest-path packages/python/Cargo.toml --out /tmp/wheels
-          uv pip install --force-reinstall /tmp/wheels/rustima-*.whl
-
-      - name: Run Tier B nightly tests
-        # Tier B는 test_matrix_tier_a.py 로 통합됨 (@nightly 마커, 커밋 a903551)
-        run: .venv/bin/python -m pytest packages/python/tests/test_matrix_tier_a.py -m nightly -v --tb=short
-
   benchmark:
     name: Performance Benchmark
     runs-on: ubuntu-latest
@@ -65,7 +33,7 @@ jobs:
       - name: Create venv and install deps
         run: |
           uv venv .venv
-          uv pip install numpy pytest statsmodels scipy pandas
+          uv pip install numpy statsmodels scipy pandas
 
       - name: Build wheel (release) and install
         run: |

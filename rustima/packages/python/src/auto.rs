@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rustima_core::auto::{self, Criterion, SearchOptions};
 
-use crate::inputs::{prepare_single_request, ModelFlags};
+use crate::inputs::{exog_cols, parse_config, ModelFlags};
 use crate::outputs::{fit_result_dict, to_pyerr};
 
 #[pyfunction]
@@ -39,11 +39,11 @@ pub(super) fn _auto_arima<'py>(
     maxiter: Option<u64>,
 ) -> PyResult<Py<PyDict>> {
     let y = y.as_slice()?;
-    let (config, x) = prepare_single_request(
-        y,
+    let x = exog_cols(y.len(), exog.as_ref())?;
+    let config = parse_config(
         (0, 0, 0),
         (0, 0, 0, 0),
-        exog.as_ref(),
+        x.as_ref().map_or(0, Vec::len),
         &ModelFlags {
             enforce_stationarity,
             enforce_invertibility,

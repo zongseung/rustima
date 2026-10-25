@@ -8,19 +8,6 @@ use crate::types::SarimaxConfig;
 // Parameter transformations (constrained ↔ unconstrained)
 // ---------------------------------------------------------------------------
 
-/// Transform constrained parameters to unconstrained space for optimization.
-///
-/// Layout: `[trend | exog | ar(p) | ma(q) | sar(P) | sma(Q) | sigma2?]`
-pub(super) fn expected_param_len(config: &SarimaxConfig) -> usize {
-    config.trend.k_trend()
-        + config.n_exog
-        + config.order.p
-        + config.order.q
-        + config.order.pp
-        + config.order.qq
-        + if config.concentrate_scale { 0 } else { 1 }
-}
-
 /// Direction of parameter transformation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransformDirection {
@@ -41,7 +28,7 @@ fn transform_params_inner(
     config: &SarimaxConfig,
     direction: TransformDirection,
 ) -> Result<Vec<f64>> {
-    let expected = expected_param_len(config);
+    let expected = config.n_params();
     if input.len() != expected {
         return Err(SarimaxError::ParamLengthMismatch {
             expected,

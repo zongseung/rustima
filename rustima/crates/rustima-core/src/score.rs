@@ -16,9 +16,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::error::{Result, SarimaxError};
 use crate::initialization::{solve_lyapunov_general, KalmanInit};
-use crate::kalman::{
-    check_convergence, SparseT, SparseZ, STEADY_STATE_MIN_STEPS,
-};
+use crate::filter_policy::{f_usable, SteadyStateDetector, KF_FT_FALLBACK_VARIANCE};
+use crate::kalman::{SparseT, SparseZ};
 use crate::params::SarimaxParams;
 use crate::polynomial::{
     make_ar_poly, make_ma_poly, make_seasonal_ar_poly, make_seasonal_ma_poly, polymul,
@@ -296,15 +295,15 @@ impl TlkfSink for ObsRecords {
 /// Steady-state detection: once pz = P*Z converges, dpz = dP*Z and
 /// dF = Z'*dP*Z also converge. After convergence dp, dpz_buf and df_buf are
 /// frozen and the expensive O(k^2*np) dP update and O(k^3*np) dP predict
-/// steps are skipped. Uses the same constants and check_convergence() from
-/// kalman.rs.
+/// steps are skipped. Uses the same `SteadyStateDetector` as kalman_core, so
+/// loglike and gradient freeze at the same step. Returns `(Σ v²/F, onset)`.
 fn tlkf_pass<S: TlkfSink>(
     endog: &[f64],
     ss: &StateSpace,
     init: &KalmanInit,
     derivs: &SystemDerivatives,
     sink: &mut S,
-) -> Result<f64> {
+) -> Result<(f64, Option<usize>)> {
     let n = endog.len();
     let k = ss.k_states;
     let burn = init.loglikelihood_burn;
@@ -393,9 +392,8 @@ fn tlkf_pass<S: TlkfSink>(
     let mut sum_v2_f = 0.0; // Sum v^2/F  (for sigma^2)
 
     // Steady-state detection state
-    let mut pz_prev = DVector::<f64>::zeros(k);
+    let mut detector = SteadyStateDetector::new(k);
     let mut ss_converged = false;
-    let mut ss_consec = 0_usize;
     let mut f_inv_steady = 0.0;
 
     for t in 0..n {
@@ -490,7 +488,7 @@ fn tlkf_pass<S: TlkfSink>(
         sparse_z.p_mul_z_into(&p, &mut pz, k);
         let f_t = sparse_z.z_dot_pz(&pz);
 
-        if f_t <= 0.0 {
+        if !f_usable(f_t) {
             if t >= burn {
                 // Mirror kalman_core's boundary safeguard (same constant):
                 // charge the fallback variance so the GRADIENT stays finite
@@ -499,7 +497,7 @@ fn tlkf_pass<S: TlkfSink>(
                 // the near-unit-root region the safeguard exists to make
                 // navigable (DIAGNOSIS_V9 S1 divergence). dF/dtheta = 0
                 // because F is the fallback constant here.
-                let f_safe: f64 = crate::optimizer::KF_FT_FALLBACK_VARIANCE;
+                let f_safe: f64 = KF_FT_FALLBACK_VARIANCE;
                 let f_inv_safe = 1.0 / f_safe;
                 for i in 0..np {
                     let dd_i_t = if !derivs.dd[i].is_empty() && t < derivs.dd[i].len() {
@@ -670,37 +668,19 @@ fn tlkf_pass<S: TlkfSink>(
             p += &rqr;
         }
 
-        // ---- Step 7: Steady-state convergence check (pz-vector based) ----
-        // Same criterion as kalman.rs: check if pz = P*Z has converged.
+        // ---- Step 7: Steady-state convergence check — the same detector as kalman_core ----
         // Once pz converges, P has converged, so dP also converges.
-        if t >= burn + STEADY_STATE_MIN_STEPS {
-            // Recompute pz from the PREDICTED P (just updated above)
-            sparse_z.p_mul_z_into(&p, &mut pz, k);
-
-            if check_convergence(&pz, &pz_prev, &mut ss_consec) {
-                let f_steady = sparse_z.z_dot_pz(&pz);
-                // Same adoption guard as kalman_core: only freeze the
-                // steady state if F_inf is positive and finite — otherwise
-                // 1/F_inf would poison every later gradient with NaN while
-                // the loglike pass stays on its finite non-converged path.
-                if f_steady > 0.0 && f_steady.is_finite() {
-                    ss_converged = true;
-                    f_inv_steady = 1.0 / f_steady;
-                    // dpz_buf and df_buf are already at their steady-state
-                    // values from the last non-steady iteration
-                }
-            }
-            pz_prev.copy_from(&pz);
-        } else if t >= burn {
-            // Before min_steps, just track pz for comparison
-            sparse_z.p_mul_z_into(&p, &mut pz, k);
-            pz_prev.copy_from(&pz);
+        if let Some(f_steady) = detector.observe(t, burn, &p, z, &mut pz) {
+            ss_converged = true;
+            f_inv_steady = 1.0 / f_steady;
+            // dpz_buf and df_buf are already at their steady-state values from the
+            // last non-steady iteration
         }
 
         std::mem::swap(&mut a, &mut a_next);
     }
 
-    Ok(sum_v2_f)
+    Ok((sum_v2_f, detector.onset))
 }
 
 /// Compute the score vector dloglike/dtheta using the tangent linear Kalman filter.
@@ -733,7 +713,7 @@ pub fn score(
     }
 
     let mut sums = ScoreSums::new(np);
-    let sum_v2_f = tlkf_pass(endog, ss, init, &derivs, &mut sums)?;
+    let (sum_v2_f, _) = tlkf_pass(endog, ss, init, &derivs, &mut sums)?;
 
     // ---- Assemble score ----
     // Concentrated (scale-free filter, Q=1): ll = -n/2(ln2π+1+ln σ̂²) - ½Σln F,
@@ -803,7 +783,7 @@ pub fn score_obs(
     }
 
     let mut recs = ObsRecords::with_capacity(n_eff);
-    let sum_v2_f = tlkf_pass(endog, ss, init, &derivs, &mut recs)?;
+    let (sum_v2_f, _) = tlkf_pass(endog, ss, init, &derivs, &mut recs)?;
 
     // ---- Assemble per-observation Harvey scores ----
     // Same convention as score(): with a non-concentrated filter Q=σ², F_t
@@ -1403,5 +1383,35 @@ mod tests {
         let numerical = numerical_gradient(&data, &config, &params_flat, None);
 
         assert_gradient_close(&analytical, &numerical, 1e-3, "AR(1) with trend='c'");
+    }
+
+    /// Loglike and gradient must freeze the steady state at the same step. A mismatch is
+    /// invisible to value-based tests (frozen and fresh values agree to ~1e-9), so the
+    /// adoption step itself is compared.
+    #[test]
+    fn loglike_and_score_adopt_steady_state_at_same_step() {
+        use crate::filter_policy::{STEADY_STATE_CONSEC, STEADY_STATE_MIN_STEPS};
+        use crate::kalman::kalman_filter;
+        use crate::test_helpers::{load_fixtures, make_config_enforced};
+        let case = &load_fixtures()["ar1"];
+        let read = |key: &str| -> Vec<f64> {
+            case[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+        };
+        let (data, params) = (read("data"), read("params"));
+        let config = make_config_enforced(1, 0, 0);
+        let sparams = SarimaxParams::from_flat(&params, &config).unwrap();
+        let ss = StateSpace::new(&config, &sparams, &data, None).unwrap();
+        let init = KalmanInit::from_config_default(&ss, &config);
+        let fo = kalman_filter(&data, &ss, &init, config.concentrate_scale).unwrap();
+        let derivs = precompute_derivatives(&config, &sparams, &ss, data.len(), None);
+        let mut sums = ScoreSums::new(derivs.n_params);
+        let (_, onset) = tlkf_pass(&data, &ss, &init, &derivs, &mut sums).unwrap();
+        // Stationary init: P is converged from the first step, so adoption happens at the
+        // earliest possible t = burn + MIN_STEPS + CONSEC.
+        assert_eq!(
+            onset,
+            Some(init.loglikelihood_burn + STEADY_STATE_MIN_STEPS + STEADY_STATE_CONSEC)
+        );
+        assert_eq!(fo.period_converged, onset);
     }
 }

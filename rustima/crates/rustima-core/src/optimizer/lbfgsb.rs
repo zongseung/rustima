@@ -6,45 +6,94 @@ use crate::error::SarimaxError;
 
 pub(super) const INVALID_COST: f64 = f64::MAX / 2.0;
 
-/// Keep validation ahead of fast paths so unavailable methods never succeed silently.
-pub(super) fn parse_method(method: &str) -> Result<&str, SarimaxError> {
-    const METHODS: &[&str] = &[
-        "lbfgsb",
-        "lbfgsb-multi",
-        "lbfgsb-adaptive",
-        "lbfgsb-hybrid",
-        "lbfgsb-strict",
-        "lbfgsb_single",
-        "lbfgs",
-        "bfgs",
-        "trust-region",
-        "profile-trust-region",
-        "nelder-mead",
-        "nm",
-    ];
-    const BASIN: &[&str] = &[
-        "lbfgsb",
-        "lbfgsb-strict",
-        "lbfgsb-multi",
-        "lbfgsb-adaptive",
-        "lbfgsb-hybrid",
-    ];
-    if let Some(strategy) = method.strip_prefix("basin-") {
-        if BASIN.contains(&strategy) {
-            return Ok(strategy);
-        }
-    } else if METHODS.contains(&method) {
-        return Ok(method);
+/// A parsed optimizer method. `fit` parses the name once; everything downstream
+/// matches on the variant, never on the string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Method {
+    Lbfgsb,
+    LbfgsbMulti,
+    LbfgsbAdaptive,
+    LbfgsbHybrid,
+    LbfgsbStrict,
+    Lbfgs,
+    Bfgs,
+    TrustRegion,
+    ProfileTrustRegion,
+    NelderMead,
+}
+
+/// `(name, method, accepts the "basin-" prefix)`.
+const METHODS: &[(&str, Method, bool)] = &[
+    ("lbfgsb", Method::Lbfgsb, true),
+    ("lbfgsb-multi", Method::LbfgsbMulti, true),
+    ("lbfgsb-adaptive", Method::LbfgsbAdaptive, true),
+    ("lbfgsb-hybrid", Method::LbfgsbHybrid, true),
+    ("lbfgsb-strict", Method::LbfgsbStrict, true),
+    ("lbfgsb_single", Method::LbfgsbStrict, false),
+    ("lbfgs", Method::Lbfgs, false),
+    ("bfgs", Method::Bfgs, false),
+    ("trust-region", Method::TrustRegion, false),
+    ("profile-trust-region", Method::ProfileTrustRegion, false),
+    ("nelder-mead", Method::NelderMead, false),
+    ("nm", Method::NelderMead, false),
+];
+
+impl Method {
+    /// Keep validation ahead of fast paths so unavailable methods never succeed silently.
+    pub(super) fn parse(method: &str) -> Result<Self, SarimaxError> {
+        let (name, basin) = match method.strip_prefix("basin-") {
+            Some(rest) => (rest, true),
+            None => (method, false),
+        };
+        METHODS
+            .iter()
+            .find(|(n, _, basin_ok)| *n == name && (!basin || *basin_ok))
+            .map(|(_, m, _)| *m)
+            .ok_or_else(|| {
+                let names = |basin: bool| {
+                    METHODS
+                        .iter()
+                        .filter(|(_, _, ok)| !basin || *ok)
+                        .map(|(n, _, _)| if basin { format!("basin-{n}") } else { n.to_string() })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                SarimaxError::OptimizationFailed(format!(
+                    "unknown method: '{method}'. Valid methods: {}, {}",
+                    names(false),
+                    names(true),
+                ))
+            })
     }
-    let basin_methods = BASIN
-        .iter()
-        .map(|name| format!("basin-{name}"))
-        .collect::<Vec<_>>();
-    Err(SarimaxError::OptimizationFailed(format!(
-        "unknown method: '{method}'. Valid methods: {}, {}",
-        METHODS.join(", "),
-        basin_methods.join(", "),
-    )))
+
+    /// Label reported when no optimizer ran (zero-parameter or `maxiter=0` results).
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Method::Lbfgsb => "basin-lbfgsb",
+            Method::LbfgsbMulti => "basin-lbfgsb-multi",
+            Method::LbfgsbAdaptive => "basin-lbfgsb-adaptive",
+            Method::LbfgsbHybrid => "basin-lbfgsb-hybrid",
+            Method::LbfgsbStrict => "basin-lbfgsb-strict",
+            Method::Lbfgs => "lbfgs",
+            Method::Bfgs => "bfgs",
+            Method::TrustRegion => "trust-region",
+            Method::ProfileTrustRegion => "profile-trust-region",
+            Method::NelderMead => "nelder-mead",
+        }
+    }
+}
+
+impl From<String> for RunError {
+    /// Basin solver errors carry no work count.
+    fn from(message: String) -> Self {
+        RunError { message, work: 0 }
+    }
+}
+
+impl From<RunError> for SarimaxError {
+    fn from(e: RunError) -> Self {
+        SarimaxError::OptimizationFailed(e.message)
+    }
 }
 
 pub(super) trait Objective {
@@ -227,10 +276,12 @@ mod tests {
 
     #[test]
     fn method_selection_and_validation() {
-        assert_eq!(parse_method("lbfgsb").unwrap(), "lbfgsb");
-        assert!(parse_method("basin-bfgs").is_err());
-        assert!(parse_method("basin-lbfgsb_single").is_err());
-        assert_eq!(parse_method("basin-lbfgsb-multi").unwrap(), "lbfgsb-multi");
+        assert_eq!(Method::parse("lbfgsb").unwrap(), Method::Lbfgsb);
+        assert!(Method::parse("basin-bfgs").is_err());
+        assert!(Method::parse("basin-lbfgsb_single").is_err());
+        assert_eq!(Method::parse("basin-lbfgsb-multi").unwrap(), Method::LbfgsbMulti);
+        assert_eq!(Method::parse("lbfgsb_single").unwrap().label(), "basin-lbfgsb-strict");
+        assert_eq!(Method::parse("nm").unwrap().label(), "nelder-mead");
     }
 
     mod basin {

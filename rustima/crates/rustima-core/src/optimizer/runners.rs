@@ -162,23 +162,28 @@ where
     basin_outcome(result)
 }
 
+/// Initial simplex: the start plus one vertex per dimension, displaced by 5% of
+/// the coordinate, or by `zero_step` when `|x_i| <= min_abs`.
+pub(super) fn simplex(start: &[f64], min_abs: f64, zero_step: f64) -> Vec<Vec<f64>> {
+    let mut simplex = vec![start.to_vec()];
+    for i in 0..start.len() {
+        let mut vertex = start.to_vec();
+        vertex[i] += if vertex[i].abs() > min_abs {
+            vertex[i] * 0.05
+        } else {
+            zero_step
+        };
+        simplex.push(vertex);
+    }
+    simplex
+}
+
 pub(super) fn run_nelder_mead(
     objective: SarimaxObjective,
     init_params: Vec<f64>,
     maxiter: u64,
 ) -> RunOutcome {
-    let mut simplex = vec![init_params.clone()];
-    for i in 0..init_params.len() {
-        let mut vertex = init_params.clone();
-        let delta = if vertex[i].abs() > 1e-8 {
-            vertex[i] * 0.05
-        } else {
-            0.00025
-        };
-        vertex[i] += delta;
-        simplex.push(vertex);
-    }
-    run_simplex(objective, simplex, maxiter, 1e-6)
+    run_simplex(objective, simplex(&init_params, 1e-8, 0.00025), maxiter, 1e-6)
 }
 
 // ---------------------------------------------------------------------------

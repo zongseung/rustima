@@ -1,7 +1,6 @@
-use crate::css::apply_differencing;
 use crate::error::{Result, SarimaxError};
-use crate::initialization::KalmanInit;
 use crate::kalman::{kalman_filter, kalman_filter_with_snapshots, KalmanFilterOutput};
+use crate::model::{difference_future_exog, Prepared};
 use crate::params::SarimaxParams;
 use crate::state_space::StateSpace;
 use crate::types::SarimaxConfig;
@@ -68,6 +67,45 @@ pub fn forecast(
     )
 }
 
+fn validate_future_exog(
+    future_exog: Option<&[Vec<f64>]>,
+    n_exog: usize,
+    steps: usize,
+) -> Result<()> {
+    // Validate: exog model requires future_exog for forecasting
+    if n_exog > 0 && future_exog.is_none() && steps > 0 {
+        return Err(SarimaxError::InvalidInput(
+            "model has exogenous variables: future_exog is required for forecasting".into(),
+        ));
+    }
+    if let Some(cols) = future_exog {
+        if cols.len() != n_exog {
+            return Err(SarimaxError::InvalidInput(format!(
+                "future_exog column count mismatch: expected {}, got {}",
+                n_exog,
+                cols.len()
+            )));
+        }
+        for (j, col) in cols.iter().enumerate() {
+            if col.len() < steps {
+                return Err(SarimaxError::InvalidInput(format!(
+                    "future_exog column {} has {} rows but {} forecast steps requested",
+                    j,
+                    col.len(),
+                    steps
+                )));
+            }
+            if col.iter().any(|v| !v.is_finite()) {
+                return Err(SarimaxError::InvalidInput(format!(
+                    "future_exog column {} contains NaN or Inf values",
+                    j
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute h-step ahead forecast from an arbitrary predicted state.
 ///
 /// Same propagation as [`forecast`], but takes (a, P, scale) directly so a
@@ -91,37 +129,7 @@ pub fn forecast_from_state(
 ) -> Result<ForecastResult> {
     crate::validation::validate_alpha(alpha)?;
     crate::validation::validate_steps(steps)?;
-    // Validate: exog model requires future_exog for forecasting
-    if !exog_coeffs.is_empty() && future_exog.is_none() && steps > 0 {
-        return Err(SarimaxError::InvalidInput(
-            "model has exogenous variables: future_exog is required for forecasting".into(),
-        ));
-    }
-    if let Some(cols) = future_exog {
-        if cols.len() != exog_coeffs.len() {
-            return Err(SarimaxError::InvalidInput(format!(
-                "future_exog column count mismatch: expected {}, got {}",
-                exog_coeffs.len(),
-                cols.len()
-            )));
-        }
-        for (j, col) in cols.iter().enumerate() {
-            if col.len() < steps {
-                return Err(SarimaxError::InvalidInput(format!(
-                    "future_exog column {} has {} rows but {} forecast steps requested",
-                    j,
-                    col.len(),
-                    steps
-                )));
-            }
-            if col.iter().any(|v| !v.is_finite()) {
-                return Err(SarimaxError::InvalidInput(format!(
-                    "future_exog column {} contains NaN or Inf values",
-                    j
-                )));
-            }
-        }
-    }
+    validate_future_exog(future_exog, exog_coeffs.len(), steps)?;
 
     if steps == 0 {
         return Ok(ForecastResult {
@@ -220,7 +228,7 @@ pub fn forecast_from_state(
 /// Non-concentrated mode (default): F_t already includes sigma2 (Q=[[sigma2]]),
 /// so standardize by sqrt(F_t) — multiplying by scale again would shrink the
 /// residuals by sqrt(sigma2).
-pub fn compute_residuals(
+pub(crate) fn compute_residuals(
     filter_output: &KalmanFilterOutput,
     concentrate_scale: bool,
 ) -> ResidualOutput {
@@ -254,12 +262,11 @@ pub fn compute_residuals(
 
 /// Run forecast pipeline: build state space → filter → forecast.
 ///
-/// When `config.simple_differencing=true`:
-///   1. Pre-difference the endog (and trim exog accordingly)
-///   2. Run Kalman filter on the differenced series (ARMA-only state space)
-///   3. Forecast in differenced space
-///   4. Undifference the forecast to reconstruct original-scale means and variances
-pub fn forecast_pipeline(
+/// When `config.simple_differencing=true` the filter runs on the differenced
+/// series (ARMA-only state space), the forecast is made in differenced space
+/// with future exog differenced the same way, then undifferenced back to the
+/// original scale.
+pub(crate) fn forecast_pipeline(
     endog: &[f64],
     config: &SarimaxConfig,
     params: &SarimaxParams,
@@ -270,53 +277,31 @@ pub fn forecast_pipeline(
 ) -> Result<ForecastResult> {
     crate::validation::validate_alpha(alpha)?;
     crate::validation::validate_steps(steps)?;
-    if config.simple_differencing {
-        // Pre-difference the data
-        let eff_endog = apply_differencing(endog, config);
-        let n_drop = endog.len() - eff_endog.len();
-        let eff_exog_owned: Option<Vec<Vec<f64>>> = match exog {
-            Some(cols) => {
-                let mut trimmed = Vec::with_capacity(cols.len());
-                for (j, col) in cols.iter().enumerate() {
-                    if col.len() < n_drop {
-                        return Err(crate::error::SarimaxError::InvalidInput(format!(
-                            "exog column {} has {} rows, but simple_differencing requires dropping {} rows",
-                            j, col.len(), n_drop
-                        )));
-                    }
-                    trimmed.push(col[n_drop..].to_vec());
-                }
-                Some(trimmed)
-            }
-            None => None,
-        };
-        let eff_exog = eff_exog_owned.as_deref();
-
-        let ss = StateSpace::new(config, params, &eff_endog, eff_exog)?;
-        let init = KalmanInit::from_config_default(&ss, config);
-        let fo = kalman_filter(&eff_endog, &ss, &init, config.concentrate_scale)?;
-
-        // Forecast in differenced space (future_exog is for future steps, no trimming)
-        let diff_fc = forecast(
-            &ss,
-            &fo,
-            steps,
-            alpha,
-            future_exog,
-            &params.exog_coeffs,
-            config,
-            params,
-            eff_endog.len(),
-        )?;
-
-        // Undifference back to original scale
-        Ok(undifference_forecast(&diff_fc.mean, &diff_fc.variance, endog, config, alpha))
-    } else {
-        let ss = StateSpace::new(config, params, endog, exog)?;
-        let init = KalmanInit::from_config_default(&ss, config);
-        let fo = kalman_filter(endog, &ss, &init, config.concentrate_scale)?;
-        forecast(&ss, &fo, steps, alpha, future_exog, &params.exog_coeffs, config, params, endog.len())
+    // Validate raw columns before differencing can discard extra columns via zip.
+    validate_future_exog(future_exog, params.exog_coeffs.len(), steps)?;
+    let data = Prepared::new(endog, exog, config)?;
+    let (ss, init) = data.system(params)?;
+    let fo = kalman_filter(data.endog(), &ss, &init, config.concentrate_scale)?;
+    if !config.simple_differencing {
+        return forecast(&ss, &fo, steps, alpha, future_exog, &params.exog_coeffs, config, params, endog.len());
     }
+    // β was fitted on Δx, so the future regressors must be Δx too.
+    let future = match (exog, future_exog) {
+        (Some(past), Some(fut)) => Some(difference_future_exog(past, fut, config)),
+        _ => future_exog.map(<[_]>::to_vec),
+    };
+    let diff_fc = forecast(
+        &ss,
+        &fo,
+        steps,
+        alpha,
+        future.as_deref(),
+        &params.exog_coeffs,
+        config,
+        params,
+        data.endog().len(),
+    )?;
+    Ok(undifference_forecast(&diff_fc.mean, &diff_fc.variance, endog, config, alpha))
 }
 
 /// Rolling-origin forecast output: one row per origin.
@@ -350,7 +335,7 @@ pub struct RollingForecastOutput {
 /// `simple_differencing=true` is not supported yet (per-origin
 /// undifferencing of the raw tail is future work).
 #[allow(clippy::too_many_arguments)]
-pub fn rolling_forecast_pipeline(
+pub(crate) fn rolling_forecast_pipeline(
     endog: &[f64],
     config: &SarimaxConfig,
     params: &SarimaxParams,
@@ -436,8 +421,7 @@ pub fn rolling_forecast_pipeline(
     }
 
     // Single filter pass with snapshots at every origin
-    let ss = StateSpace::new(config, params, endog, exog)?;
-    let init = KalmanInit::from_config_default(&ss, config);
+    let (ss, init) = Prepared::new(endog, exog, config)?.system(params)?;
     let (fo, snaps) =
         kalman_filter_with_snapshots(endog, &ss, &init, config.concentrate_scale, &origins)?;
 
@@ -607,17 +591,6 @@ fn compute_undo_d_initials(endog: &[f64], d: usize, dd: usize, s: usize) -> Vec<
 
     // For undo iteration i: init = derivs[d-1-i]
     (0..d).map(|i| derivs[d - 1 - i]).collect()
-}
-
-/// Run residuals pipeline: build state space → filter → residuals.
-pub fn residuals_pipeline(
-    endog: &[f64],
-    config: &SarimaxConfig,
-    params: &SarimaxParams,
-    exog: Option<&[Vec<f64>]>,
-) -> Result<ResidualOutput> {
-    let fo = crate::pipeline::kalman_filter_full(endog, params, config, exog)?;
-    Ok(compute_residuals(&fo, config.concentrate_scale))
 }
 
 /// Inverse normal CDF using the Beasley-Springer-Moro algorithm.
@@ -804,7 +777,7 @@ mod tests {
         let config = make_config(1, 0, 0);
         let params = make_params(&[0.6527425084139002], &[]);
 
-        let result = residuals_pipeline(&data, &config, &params, None).unwrap();
+        let result = compute_residuals(&Prepared::new(&data, None, &config).unwrap().filter(&params).unwrap(), config.concentrate_scale);
         assert_eq!(result.residuals.len(), data.len());
         assert_eq!(result.standardized_residuals.len(), data.len());
     }
@@ -829,7 +802,7 @@ mod tests {
         let config = make_config(1, 0, 0);
         let params = make_params(&params_vec[..1], &[]);
 
-        let result = residuals_pipeline(&data, &config, &params, None).unwrap();
+        let result = compute_residuals(&Prepared::new(&data, None, &config).unwrap().filter(&params).unwrap(), config.concentrate_scale);
 
         // After burn-in, standardized residuals should have variance ~ 1
         let burn = config.order.k_states();

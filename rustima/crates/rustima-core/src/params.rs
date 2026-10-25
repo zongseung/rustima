@@ -87,8 +87,8 @@ impl SarimaxParams {
         v
     }
 
-    /// Number of estimated parameters for AIC/BIC.
-    /// sigma2 is always counted even when concentrated.
+    /// Number of estimated parameters for AIC/BIC. Not the vector length
+    /// (`SarimaxConfig::n_params`): sigma2 is always counted even when concentrated.
     pub fn n_estimated_params(config: &SarimaxConfig) -> usize {
         config.trend.k_trend()
             + config.n_exog

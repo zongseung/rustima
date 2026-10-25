@@ -9,10 +9,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 use crate::error::{Result, SarimaxError};
-use crate::forecast::{forecast_pipeline, ForecastResult};
-use crate::optimizer;
-use crate::params::SarimaxParams;
+use crate::forecast::ForecastResult;
+use crate::model::SarimaxModel;
 use crate::types::{FitResult, SarimaxConfig};
+
+/// Bind one batch member to the shared config; validation errors stay per series.
+fn member(endog: &[f64], exog: Option<&[Vec<f64>]>, config: &SarimaxConfig) -> Result<SarimaxModel> {
+    SarimaxModel::new(endog.to_vec(), exog.map(<[_]>::to_vec), config.clone())
+}
 
 fn length_mismatch_results<T>(n: usize, msg: String) -> Vec<Result<T>> {
     (0..n)
@@ -63,7 +67,7 @@ fn isolate_panic<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 pub fn batch_loglike(
     series: &[Vec<f64>],
     config: &SarimaxConfig,
-    params: &SarimaxParams,
+    params: &[f64],
     exog_list: Option<&[Vec<Vec<f64>>]>,
 ) -> Vec<Result<f64>> {
     if let Some(el) = exog_list {
@@ -89,9 +93,7 @@ pub fn batch_loglike(
         .map(|(i, endog)| {
             isolate_panic(|| {
                 let exog = exog_list.and_then(|el| el.get(i)).map(|v| &v[..]);
-                let exog_ref: Option<&[Vec<f64>]> = exog;
-                let output = crate::pipeline::kalman_eval(endog, params, config, exog_ref)?;
-                Ok(output.loglike)
+                member(endog, exog, config)?.loglike(params)
             })
         })
         .collect()
@@ -133,15 +135,7 @@ pub fn batch_fit(
         .map(|(i, endog)| {
             isolate_panic(|| {
                 let exog = exog_list.and_then(|el| el.get(i)).map(|v| &v[..]);
-                let exog_ref: Option<&[Vec<f64>]> = exog;
-                optimizer::fit(
-                    endog,
-                    config,
-                    None,
-                    Some(method_str),
-                    Some(maxiter_val),
-                    exog_ref,
-                )
+                member(endog, exog, config)?.fit(None, Some(method_str), Some(maxiter_val))
             })
         })
         .collect()
@@ -168,16 +162,7 @@ pub fn grid_search_fit(
     configs
         .par_iter()
         .map(|config| {
-            isolate_panic(|| {
-                optimizer::fit(
-                    endog,
-                    config,
-                    None,
-                    Some(method_str),
-                    Some(maxiter_val),
-                    exog,
-                )
-            })
+            isolate_panic(|| member(endog, exog, config)?.fit(None, Some(method_str), Some(maxiter_val)))
         })
         .collect()
 }
@@ -247,10 +232,9 @@ pub fn batch_forecast(
                     params_list.len()
                 ))
             })?;
-            let sparams = SarimaxParams::from_flat(flat_params, config)?;
             let exog = exog_list.and_then(|el| el.get(i)).map(|v| &v[..]);
             let future_exog = future_exog_list.and_then(|el| el.get(i)).map(|v| &v[..]);
-            forecast_pipeline(endog, config, &sparams, steps, alpha, exog, future_exog)
+            member(endog, exog, config)?.forecast(flat_params, steps, alpha, future_exog)
             })
         })
         .collect()
@@ -260,6 +244,9 @@ pub fn batch_forecast(
 mod tests {
     use super::*;
     use crate::initialization::KalmanInit;
+    use crate::forecast::forecast_pipeline;
+    use crate::optimizer;
+    use crate::params::SarimaxParams;
     use crate::kalman::kalman_loglike;
     use crate::state_space::StateSpace;
     use crate::test_helpers::{load_fixtures, make_config_with_enforcement};
@@ -333,15 +320,7 @@ mod tests {
         let data = get_ar1_data();
         let params_vec = get_ar1_params();
         let config = make_config_with_enforcement(1, 0, 0, false, false);
-        let params = SarimaxParams {
-            trend_coeffs: vec![],
-            exog_coeffs: vec![],
-            ar_coeffs: params_vec[..1].to_vec(),
-            ma_coeffs: vec![],
-            sar_coeffs: vec![],
-            sma_coeffs: vec![],
-            sigma2: None,
-        };
+        let params = SarimaxParams::from_flat(&params_vec, &config).unwrap();
 
         // Direct single loglike — use the SAME scale convention as the
         // batch path (config.concentrate_scale), not a hardcoded one.
@@ -353,7 +332,7 @@ mod tests {
 
         // Batch loglike
         let series = vec![data.clone(), data.clone()];
-        let batch_ll = batch_loglike(&series, &config, &params, None);
+        let batch_ll = batch_loglike(&series, &config, &params_vec, None);
 
         assert_eq!(batch_ll.len(), 2);
         for (i, r) in batch_ll.iter().enumerate() {

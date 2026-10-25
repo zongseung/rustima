@@ -90,3 +90,37 @@ def test_all_failed_candidates_remain_in_history():
     assert len(fit.history) == 4
     assert all(h["aic"] is None and h["error_message"] for h in fit.history)
     assert fit.order is None and math.isinf(fit.best_ic)
+
+
+@pytest.mark.parametrize("simple_differencing", [False, True])
+def test_forecast_rejects_extra_exog_columns(simple_differencing):
+    y = series()
+    x = np.arange(len(y), dtype=float).reshape(-1, 1)
+    params = np.array([0.3, 0.4, 1.0])
+    future = np.ones((2, 2))
+    kwargs = dict(steps=2, simple_differencing=simple_differencing)
+    with pytest.raises(ValueError, match="column count"):
+        rustima.sarimax_forecast(y, (1, 1, 0), (0, 0, 0, 0), params,
+                                exog=x, future_exog=future, **kwargs)
+    results = rustima.sarimax_batch_forecast(
+        [y, y], (1, 1, 0), (0, 0, 0, 0), [params, params],
+        exog_list=[x, x], exog_forecast_list=[future, future[:, :1]], **kwargs)
+    assert "column count" in results[0]["error"]
+    assert len(results[1]["mean"]) == 2
+
+
+@pytest.mark.parametrize("operation", ["loglike", "fit", "forecast"])
+def test_batch_zero_column_exog_preserves_row_validation(operation):
+    y = series()
+    args = ([y], (1, 0, 0), (0, 0, 0, 0))
+    params = np.array([0.4, 1.0])
+    if operation == "loglike":
+        args += (params,)
+    elif operation == "forecast":
+        args += ([params],)
+    kwargs = {"maxiter": 0} if operation == "fit" else {}
+    call = getattr(rustima, f"sarimax_batch_{operation}")
+    with pytest.raises(ValueError, match="rows"):
+        call(*args, exog_list=[np.empty((len(y) - 1, 0))], **kwargs)
+    result = call(*args, exog_list=[np.empty((len(y), 0))], **kwargs)
+    assert "error" not in result[0]

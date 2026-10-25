@@ -1,16 +1,49 @@
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rustima_core::{forecast, inference, optimizer, params::SarimaxParams, pipeline};
 
-use crate::inputs::{
-    numpy2d_to_cols, prepare_single_request, validate_alpha, validate_finite_cols, validate_steps,
-    ModelFlags,
-};
+use crate::inputs::{numpy2d_to_cols, prepare_model, ModelFlags};
 use crate::outputs::{
     diagnostics_to_pydict, fit_result_to_pydict, forecast_to_pydict, inference_to_pydict,
     residuals_to_pydict, to_pyerr,
 };
+
+/// Validate a specification at construction time and report its shape:
+/// `n_obs` (observations the filter sees) and `param_names`.
+#[pyfunction]
+#[pyo3(signature = (y, order, seasonal, exog=None, concentrate_scale=false,
+                    enforce_stationarity=true, enforce_invertibility=true,
+                    trend=None, simple_differencing=false))]
+pub(super) fn _model_info<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    order: (usize, usize, usize),
+    seasonal: (usize, usize, usize, usize),
+    exog: Option<PyReadonlyArray2<'py, f64>>,
+    concentrate_scale: bool,
+    enforce_stationarity: bool,
+    enforce_invertibility: bool,
+    trend: Option<&str>,
+    simple_differencing: bool,
+) -> PyResult<Py<PyDict>> {
+    let model = prepare_model(
+        y.as_slice()?,
+        order,
+        seasonal,
+        exog.as_ref(),
+        &ModelFlags {
+            enforce_stationarity,
+            enforce_invertibility,
+            concentrate_scale,
+            simple_differencing,
+        },
+        trend,
+    )?;
+    let dict = PyDict::new(py);
+    dict.set_item("n_obs", model.n_obs())?;
+    dict.set_item("param_names", model.config().param_names())?;
+    Ok(dict.into())
+}
 
 /// Compute the SARIMAX concentrated (or full) log-likelihood.
 #[pyfunction]
@@ -30,10 +63,8 @@ pub(super) fn sarimax_loglike<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<f64> {
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -45,17 +76,8 @@ pub(super) fn sarimax_loglike<'py>(
         },
         trend,
     )?;
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-
-    py.detach(move || {
-        let sarimax_params = SarimaxParams::from_flat(&params_flat, &config)?;
-        pipeline::kalman_eval(&endog, &sarimax_params, &config, exog_cols.as_deref())
-            .map(|o| o.loglike)
-    })
-    .map_err(to_pyerr)
+    let params = params.as_slice()?.to_vec();
+    py.detach(move || model.loglike(&params)).map_err(to_pyerr)
 }
 
 /// Fit a SARIMAX model via MLE (L-BFGS-B default, with Nelder-Mead fallback).
@@ -81,9 +103,8 @@ pub(super) fn sarimax_fit<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyDict>> {
-    let endog = y.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -95,32 +116,15 @@ pub(super) fn sarimax_fit<'py>(
         },
         trend,
     )?;
-
-    let sp_owned: Option<Vec<f64>> = start_params
+    let start: Option<Vec<f64>> = start_params
         .as_ref()
-        .map(|a| a.as_slice().map(|s| s.to_vec()))
+        .map(|a| a.as_slice().map(<[_]>::to_vec))
         .transpose()?;
-    let method_owned = method.map(|s| s.to_string());
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-
+    let method = method.map(str::to_owned);
     let result = py
-        .detach(move || {
-            optimizer::fit(
-                &endog,
-                &config,
-                sp_owned.as_deref(),
-                method_owned.as_deref(),
-                maxiter,
-                exog_cols.as_deref(),
-            )
-        })
+        .detach(move || model.fit(start.as_deref(), method.as_deref(), maxiter))
         .map_err(to_pyerr)?;
-
-    let dict = fit_result_to_pydict(py, &result)?;
-
-    Ok(dict.into())
+    Ok(fit_result_to_pydict(py, &result)?.into())
 }
 
 /// Compute h-step ahead forecast for a SARIMAX model.
@@ -147,13 +151,8 @@ pub(super) fn sarimax_forecast<'py>(
     enforce_stationarity: bool,
     enforce_invertibility: bool,
 ) -> PyResult<Py<PyDict>> {
-    validate_alpha(alpha)?;
-    validate_steps(steps)?;
-
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -165,63 +164,11 @@ pub(super) fn sarimax_forecast<'py>(
         },
         trend,
     )?;
-
-    let future_exog_cols = future_exog.as_ref().map(|e| numpy2d_to_cols(e));
-    if let Some(ref cols) = future_exog_cols {
-        validate_finite_cols(cols, "future_exog")?;
-    }
-
-    let n_exog = config.n_exog;
-    if let Some(ref fec) = future_exog_cols {
-        if fec.len() != n_exog {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "future_exog column count ({}) must match exog column count ({})",
-                fec.len(),
-                n_exog
-            )));
-        }
-    }
-
-    // Validate future_exog has enough rows for forecast steps
-    if let Some(ref fec) = future_exog_cols {
-        for (j, col) in fec.iter().enumerate() {
-            if col.len() < steps {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "future_exog column {} has {} rows but {} forecast steps requested",
-                    j,
-                    col.len(),
-                    steps
-                )));
-            }
-        }
-    }
-
-    // Require future exog for exog models
-    if n_exog > 0 && steps > 0 && future_exog.is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "model has exogenous variables: future_exog is required for forecasting",
-        ));
-    }
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-
+    let params = params.as_slice()?.to_vec();
+    let future = future_exog.as_ref().map(numpy2d_to_cols);
     let result = py
-        .detach(move || {
-            let sarimax_params = SarimaxParams::from_flat(&params_flat, &config)?;
-            forecast::forecast_pipeline(
-                &endog,
-                &config,
-                &sarimax_params,
-                steps,
-                alpha,
-                exog_cols.as_deref(),
-                future_exog_cols.as_deref(),
-            )
-        })
+        .detach(move || model.forecast(&params, steps, alpha, future.as_deref()))
         .map_err(to_pyerr)?;
-
     Ok(forecast_to_pydict(py, &result)?.into())
 }
 
@@ -253,15 +200,8 @@ pub(super) fn sarimax_rolling_forecast<'py>(
     enforce_stationarity: bool,
     enforce_invertibility: bool,
 ) -> PyResult<Py<PyDict>> {
-    validate_alpha(alpha)?;
-    if horizon > 0 {
-        validate_steps(horizon)?;
-    }
-
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -273,35 +213,14 @@ pub(super) fn sarimax_rolling_forecast<'py>(
         },
         trend,
     )?;
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-
+    let params = params.as_slice()?.to_vec();
     let result = py
-        .detach(move || {
-            let sarimax_params = SarimaxParams::from_flat(&params_flat, &config)?;
-            forecast::rolling_forecast_pipeline(
-                &endog,
-                &config,
-                &sarimax_params,
-                start,
-                step,
-                horizon,
-                alpha,
-                exog_cols.as_deref(),
-            )
-        })
+        .detach(move || model.rolling_forecast(&params, start, step, horizon, alpha))
         .map_err(to_pyerr)?;
-
     let dict = PyDict::new(py);
     dict.set_item(
         "origins",
-        result
-            .origins
-            .iter()
-            .map(|&o| o as u64)
-            .collect::<Vec<u64>>(),
+        result.origins.iter().map(|&o| o as u64).collect::<Vec<u64>>(),
     )?;
     dict.set_item("mean", result.mean)?;
     dict.set_item("variance", result.variance)?;
@@ -329,10 +248,8 @@ pub(super) fn sarimax_residuals<'py>(
     enforce_stationarity: bool,
     enforce_invertibility: bool,
 ) -> PyResult<Py<PyDict>> {
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -344,18 +261,8 @@ pub(super) fn sarimax_residuals<'py>(
         },
         trend,
     )?;
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-
-    let result = py
-        .detach(move || {
-            let sarimax_params = SarimaxParams::from_flat(&params_flat, &config)?;
-            forecast::residuals_pipeline(&endog, &config, &sarimax_params, exog_cols.as_deref())
-        })
-        .map_err(to_pyerr)?;
-
+    let params = params.as_slice()?.to_vec();
+    let result = py.detach(move || model.residuals(&params)).map_err(to_pyerr)?;
     Ok(residuals_to_pydict(py, &result)?.into())
 }
 
@@ -383,12 +290,8 @@ pub(super) fn sarimax_inference<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyDict>> {
-    validate_alpha(alpha)?;
-
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -400,30 +303,11 @@ pub(super) fn sarimax_inference<'py>(
         },
         trend,
     )?;
-
-    // Reject wrong-length params up front like every other entry point —
-    // compute_inference would silently return empty arrays for an empty
-    // params vector (DIAGNOSIS_V9 W2).
-    SarimaxParams::from_flat(params_flat, &config).map_err(to_pyerr)?;
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-    let method_owned = method.to_string();
-
+    let params = params.as_slice()?.to_vec();
+    let method = method.to_owned();
     let result = py
-        .detach(move || {
-            inference::compute_inference(
-                &endog,
-                &config,
-                &params_flat,
-                &method_owned,
-                alpha,
-                exog_cols.as_deref(),
-            )
-        })
+        .detach(move || model.inference(&params, &method, alpha))
         .map_err(to_pyerr)?;
-
     Ok(inference_to_pydict(py, &result)?.into())
 }
 
@@ -447,10 +331,8 @@ pub(super) fn sarimax_diagnostics<'py>(
     enforce_stationarity: bool,
     enforce_invertibility: bool,
 ) -> PyResult<Py<PyDict>> {
-    let endog = y.as_slice()?;
-    let params_flat = params.as_slice()?;
-    let (config, exog_cols) = prepare_single_request(
-        endog,
+    let model = prepare_model(
+        y.as_slice()?,
         order,
         seasonal,
         exog.as_ref(),
@@ -462,29 +344,7 @@ pub(super) fn sarimax_diagnostics<'py>(
         },
         trend,
     )?;
-
-    // Own all data before releasing GIL
-    let endog = endog.to_vec();
-    let params_flat = params_flat.to_vec();
-
-    let result = py
-        .detach(
-            move || -> std::result::Result<_, rustima_core::error::SarimaxError> {
-                let sarimax_params = SarimaxParams::from_flat(&params_flat, &config)?;
-                let resid_result = forecast::residuals_pipeline(
-                    &endog,
-                    &config,
-                    &sarimax_params,
-                    exog_cols.as_deref(),
-                )?;
-                let n_params = params_flat.len();
-                Ok(inference::compute_diagnostics(
-                    &resid_result.standardized_residuals,
-                    n_params,
-                ))
-            },
-        )
-        .map_err(to_pyerr)?;
-
+    let params = params.as_slice()?.to_vec();
+    let result = py.detach(move || model.diagnostics(&params)).map_err(to_pyerr)?;
     Ok(diagnostics_to_pydict(py, &result)?.into())
 }

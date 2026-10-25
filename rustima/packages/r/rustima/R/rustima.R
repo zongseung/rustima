@@ -26,9 +26,8 @@
     if (!all(vapply(flags, function(x) is.logical(x) && length(x) == 1L &&
                     !is.na(x), logical(1))))
         stop("model flags must be TRUE or FALSE", call. = FALSE)
-    if (!is.character(trend) || length(trend) != 1L || is.na(trend) ||
-        !trend %in% c("n", "c", "t", "ct"))
-        stop("trend must be n, c, t or ct", call. = FALSE)
+    if (!is.character(trend) || length(trend) != 1L || is.na(trend))
+        stop("trend must be a single string", call. = FALSE)
     c(list(order = .orders(order, 3L, "order"),
            seasonal = .orders(seasonal, 4L, "seasonal"), trend = trend), flags)
 }
@@ -50,6 +49,7 @@
 
 .fit_object <- function(result, y, spec, xreg) {
     if (!is.null(result$error)) return(result)
+    names(result$params) <- result$param_names
     result$y <- y
     result$spec <- spec
     result$xreg <- xreg

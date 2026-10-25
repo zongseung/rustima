@@ -2,7 +2,6 @@ use super::*;
 use super::objective::SarimaxObjective;
 use super::trust_region::refine_exog_brent;
 use basin::{CostFunction, Gradient};
-use crate::kalman::kalman_filter;
 use crate::params::SarimaxParams;
 use crate::test_helpers::{load_fixtures, make_config_with_enforcement};
 use crate::types::SarimaxConfig;
@@ -42,9 +41,7 @@ fn test_objective_finite() {
 
     let config = make_config_with_enforcement(1, 0, 0, false, false);
     let obj = SarimaxObjective {
-        endog: data,
-        config,
-        exog: None,
+        data: Prepared::new(&data, None, &config).unwrap(),
         cache: RefCell::new(None),
         ss_cache: RefCell::new(None),
     };
@@ -79,9 +76,7 @@ fn test_exog_coordinate_polish_improves_bad_beta_start() {
         simple_differencing: false,
     };
     let obj = SarimaxObjective {
-        endog: y,
-        config: config.clone(),
-        exog: Some(exog),
+        data: Prepared::new(&y, Some(&exog), &config).unwrap(),
         cache: RefCell::new(None),
         ss_cache: RefCell::new(None),
     };
@@ -171,17 +166,9 @@ fn test_kalman_innovation_linearity_for_exog_intercept() {
     let zero = SarimaxParams::from_flat(&[0.0, 0.25, 2.0], &config).unwrap();
     let full = SarimaxParams::from_flat(&[1.7, 0.25, 2.0], &config).unwrap();
 
-    let ss_y = StateSpace::new(&config, &zero, &y, None).unwrap();
-    let init_y = KalmanInit::from_config_default(&ss_y, &config);
-    let y_filter = kalman_filter(&y, &ss_y, &init_y, false).unwrap();
-
-    let ss_x = StateSpace::new(&config, &zero, &x[0], None).unwrap();
-    let init_x = KalmanInit::from_config_default(&ss_x, &config);
-    let x_filter = kalman_filter(&x[0], &ss_x, &init_x, false).unwrap();
-
-    let ss_full = StateSpace::new(&config, &full, &y, Some(&x)).unwrap();
-    let init_full = KalmanInit::from_config_default(&ss_full, &config);
-    let full_filter = kalman_filter(&y, &ss_full, &init_full, false).unwrap();
+    let y_filter = Prepared::new(&y, None, &config).unwrap().filter(&zero).unwrap();
+    let x_filter = Prepared::new(&x[0], None, &config).unwrap().filter(&zero).unwrap();
+    let full_filter = Prepared::new(&y, Some(&x), &config).unwrap().filter(&full).unwrap();
 
     for t in 0..y.len() {
         let expected = y_filter.innovations[t] - 1.7 * x_filter.innovations[t];
@@ -208,9 +195,7 @@ fn test_gradient_finite() {
 
     let config = make_config_with_enforcement(1, 0, 0, false, false);
     let obj = SarimaxObjective {
-        endog: data,
-        config,
-        exog: None,
+        data: Prepared::new(&data, None, &config).unwrap(),
         cache: RefCell::new(None),
         ss_cache: RefCell::new(None),
     };

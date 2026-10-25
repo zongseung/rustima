@@ -61,3 +61,8 @@ stopifnot(length(sarimax_batch(list(), c(1, 0, 0))) == 0L,
           fails(sarimax(y, c(1, 0, 0), optimizer = "unknown")),
           fails(sarimax_batch(list(y), c(1, 0, 0), nthreads = 0)),
           fails(predict(fit, 10001L)), fails(predict(fit, level = NaN)))
+
+sd_reg <- sarimax(cumsum(y), c(1, 1, 0), xreg = x[, 1, drop = FALSE],
+                  simple_differencing = TRUE, start_params = c(0.3, 0.4, 1), maxiter = 0L)
+stopifnot(fails(predict(sd_reg, 2L, newxreg = x[1:2, , drop = FALSE])),
+          length(predict(sd_reg, 2L, newxreg = x[1:2, 1, drop = FALSE])$pred) == 2L)

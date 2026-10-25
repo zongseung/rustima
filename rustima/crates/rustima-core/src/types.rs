@@ -131,6 +131,27 @@ impl SarimaxConfig {
             + if self.concentrate_scale { 0 } else { 1 }
     }
 
+    /// statsmodels-style names for the flat parameter vector, in `n_params` order.
+    pub fn param_names(&self) -> Vec<String> {
+        let o = &self.order;
+        let mut names = Vec::with_capacity(self.n_params());
+        match self.trend {
+            Trend::None => {}
+            Trend::Constant => names.push("intercept".into()),
+            Trend::Linear => names.push("drift".into()),
+            Trend::Both => names.extend(["intercept".into(), "drift".into()]),
+        }
+        names.extend((1..=self.n_exog).map(|i| format!("x{i}")));
+        names.extend((1..=o.p).map(|i| format!("ar.L{i}")));
+        names.extend((1..=o.q).map(|i| format!("ma.L{i}")));
+        names.extend((1..=o.pp).map(|i| format!("ar.S.L{}", i * o.s)));
+        names.extend((1..=o.qq).map(|i| format!("ma.S.L{}", i * o.s)));
+        if !self.concentrate_scale {
+            names.push("sigma2".into());
+        }
+        names
+    }
+
     /// Effective diffuse-state offset.
     ///
     /// Returns 0 when `simple_differencing=true` (diff states already removed
@@ -258,6 +279,30 @@ mod tests {
         assert_eq!(Trend::Constant.k_trend(), 1);
         assert_eq!(Trend::Linear.k_trend(), 1);
         assert_eq!(Trend::Both.k_trend(), 2);
+    }
+
+    #[test]
+    fn param_names_match_layout() {
+        let c = SarimaxConfig {
+            order: SarimaxOrder::new(1, 0, 1, 1, 0, 1, 12),
+            n_exog: 2,
+            trend: Trend::Both,
+            ..SarimaxConfig::default()
+        };
+        assert_eq!(
+            c.param_names(),
+            ["intercept", "drift", "x1", "x2", "ar.L1", "ma.L1", "ar.S.L12", "ma.S.L12", "sigma2"]
+        );
+        for p in 0..3 {
+            for concentrate_scale in [false, true] {
+                let c = SarimaxConfig {
+                    order: SarimaxOrder::new(p, 1, 2, 0, 0, 0, 0),
+                    concentrate_scale,
+                    ..SarimaxConfig::default()
+                };
+                assert_eq!(c.param_names().len(), c.n_params());
+            }
+        }
     }
 
     #[test]

@@ -10,13 +10,14 @@ use std::convert::Infallible;
 use crate::css;
 use crate::initialization::KalmanInit;
 use crate::kalman::{kalman_filter_batched, kalman_loglike};
+use crate::model::Prepared;
 use crate::params::SarimaxParams;
 use crate::score;
 use crate::state_space::StateSpace;
 use crate::types::SarimaxConfig;
 
-use super::transforms::{apply_transform_jacobian, expected_param_len, transform_params};
-use super::KF_FT_FALLBACK_VARIANCE;
+use super::transforms::{apply_transform_jacobian, transform_params};
+use crate::filter_policy::{f_usable, KF_FT_FALLBACK_VARIANCE};
 
 // ---------------------------------------------------------------------------
 // Objective function for Basin
@@ -34,9 +35,8 @@ pub(super) struct CachedEval {
 
 /// Negative log-likelihood objective for optimizer.
 pub(super) struct SarimaxObjective {
-    pub(super) endog: Vec<f64>,
-    pub(super) config: SarimaxConfig,
-    pub(super) exog: Option<Vec<Vec<f64>>>,
+    /// Observations as the filter sees them (already differenced under simple_differencing).
+    pub(super) data: Prepared,
     /// Single-entry cache: stores the last fused (cost, gradient) evaluation.
     /// Populated by `gradient()`, consumed by `cost()` at the same params.
     pub(super) cache: RefCell<Option<CachedEval>>,
@@ -48,9 +48,7 @@ pub(super) struct SarimaxObjective {
 impl Clone for SarimaxObjective {
     fn clone(&self) -> Self {
         SarimaxObjective {
-            endog: self.endog.clone(),
-            config: self.config.clone(),
-            exog: self.exog.clone(),
+            data: self.data.clone(),
             cache: RefCell::new(None), // cloned objectives start with empty cache
             ss_cache: RefCell::new(None), // cloned objectives build fresh SS
         }
@@ -58,14 +56,18 @@ impl Clone for SarimaxObjective {
 }
 
 impl SarimaxObjective {
+    pub(super) fn config(&self) -> &SarimaxConfig {
+        self.data.config()
+    }
+
     /// Take cached StateSpace (updating in-place) or build a new one.
     fn take_or_build_ss(&self, sparams: &SarimaxParams) -> std::result::Result<StateSpace, String> {
         match self.ss_cache.borrow_mut().take() {
             Some(mut ss) => {
-                ss.update_params(&self.config, sparams, &self.endog, self.exog.as_deref());
+                ss.update_params(self.config(), sparams, self.data.endog(), self.data.exog());
                 Ok(ss)
             }
-            None => StateSpace::new(&self.config, sparams, &self.endog, self.exog.as_deref())
+            None => StateSpace::new(self.config(), sparams, self.data.endog(), self.data.exog())
                 .map_err(|e| e.to_string()),
         }
     }
@@ -85,11 +87,11 @@ impl SarimaxObjective {
         unconstrained: &[f64],
     ) -> std::result::Result<(SarimaxParams, StateSpace, KalmanInit), String> {
         let constrained =
-            transform_params(unconstrained, &self.config).map_err(|e| e.to_string())?;
+            transform_params(unconstrained, self.config()).map_err(|e| e.to_string())?;
         let sparams =
-            SarimaxParams::from_flat(&constrained, &self.config).map_err(|e| e.to_string())?;
+            SarimaxParams::from_flat(&constrained, self.config()).map_err(|e| e.to_string())?;
         let ss = self.take_or_build_ss(&sparams)?;
-        let init = KalmanInit::from_config_default(&ss, &self.config);
+        let init = KalmanInit::from_config_default(&ss, self.config());
         Ok((sparams, ss, init))
     }
 
@@ -106,7 +108,7 @@ impl SarimaxObjective {
     pub(super) fn eval_loglike(&self, unconstrained: &[f64]) -> std::result::Result<f64, String> {
         let (_sparams, ss, init) = self.eval_pipeline(unconstrained)?;
 
-        let result = kalman_loglike(&self.endog, &ss, &init, self.config.concentrate_scale);
+        let result = kalman_loglike(self.data.endog(), &ss, &init, self.config().concentrate_scale);
         self.return_ss(ss);
 
         let output = result.map_err(|e| e.to_string())?;
@@ -132,13 +134,13 @@ impl SarimaxObjective {
 
         // Score in constrained space: ∂ll/∂θ_constrained
         let score_result = score::score(
-            &self.endog,
+            self.data.endog(),
             &ss,
             &init,
-            &self.config,
+            self.config(),
             &sparams,
-            self.config.concentrate_scale,
-            self.exog.as_deref(),
+            self.config().concentrate_scale,
+            self.data.exog(),
         );
         self.return_ss(ss);
 
@@ -146,7 +148,7 @@ impl SarimaxObjective {
 
         // Chain rule: ∂(-ll)/∂u = -J' · ∂ll/∂θ
         // where J[j,i] = ∂θ_j / ∂u_i (Jacobian of transform_params)
-        let grad = apply_transform_jacobian(&score_constrained, unconstrained, &self.config)?;
+        let grad = apply_transform_jacobian(&score_constrained, unconstrained, self.config())?;
 
         // Return negative gradient (minimizing -loglike)
         Ok(grad.iter().map(|&g| -g).collect())
@@ -164,7 +166,7 @@ impl SarimaxObjective {
         let (sparams, ss, init) = self.eval_pipeline(unconstrained)?;
 
         // 1. Log-likelihood (forward KF)
-        let kf_result = kalman_loglike(&self.endog, &ss, &init, self.config.concentrate_scale);
+        let kf_result = kalman_loglike(self.data.endog(), &ss, &init, self.config().concentrate_scale);
 
         let output = match kf_result {
             Ok(o) => o,
@@ -182,20 +184,20 @@ impl SarimaxObjective {
 
         // 2. Score (tangent linear KF, reuses ss and init)
         let score_result = score::score(
-            &self.endog,
+            self.data.endog(),
             &ss,
             &init,
-            &self.config,
+            self.config(),
             &sparams,
-            self.config.concentrate_scale,
-            self.exog.as_deref(),
+            self.config().concentrate_scale,
+            self.data.exog(),
         );
         self.return_ss(ss);
 
         let score_constrained = score_result.map_err(|e| e.to_string())?;
 
         // 3. Chain rule: ∂(-ll)/∂u = -J' · ∂ll/∂θ
-        let grad = apply_transform_jacobian(&score_constrained, unconstrained, &self.config)?;
+        let grad = apply_transform_jacobian(&score_constrained, unconstrained, self.config())?;
         let neg_grad: Vec<f64> = grad.iter().map(|&g| -g).collect();
 
         Ok((negll, neg_grad))
@@ -207,7 +209,7 @@ impl SarimaxObjective {
 /// Layout is the standard unconstrained layout with the exog beta block removed:
 /// `[trend | ar(p) | ma(q) | sar(P) | sma(Q) | sigma2?]`.
 fn profiled_param_len(config: &SarimaxConfig) -> usize {
-    expected_param_len(config).saturating_sub(config.n_exog)
+    config.n_params().saturating_sub(config.n_exog)
 }
 
 pub(super) fn remove_exog_block(flat: &[f64], config: &SarimaxConfig) -> Vec<f64> {
@@ -343,15 +345,8 @@ impl ProfiledSarimaxObjective {
         let mut xtwy = DVector::<f64>::zeros(n_exog);
 
         for t in burn..n_total {
-            let f_t = innovation_vars
-                .get(t)
-                .copied()
-                .unwrap_or(KF_FT_FALLBACK_VARIANCE);
-            let f_safe = if f_t > 0.0 && f_t.is_finite() {
-                f_t
-            } else {
-                KF_FT_FALLBACK_VARIANCE
-            };
+            let f_t = innovation_vars[t];
+            let f_safe = if f_usable(f_t) { f_t } else { KF_FT_FALLBACK_VARIANCE };
             let w = 1.0 / f_safe;
             let vy = y_innovations[t];
             for i in 0..n_exog {
@@ -372,15 +367,8 @@ impl ProfiledSarimaxObjective {
         let mut sum_log_f = 0.0;
         let mut sum_v2_f = 0.0;
         for t in burn..n_total {
-            let f_t = innovation_vars
-                .get(t)
-                .copied()
-                .unwrap_or(KF_FT_FALLBACK_VARIANCE);
-            let f_safe = if f_t > 0.0 && f_t.is_finite() {
-                f_t
-            } else {
-                KF_FT_FALLBACK_VARIANCE
-            };
+            let f_t = innovation_vars[t];
+            let f_safe = if f_usable(f_t) { f_t } else { KF_FT_FALLBACK_VARIANCE };
             let mut resid = y_innovations[t];
             for j in 0..n_exog {
                 resid -= beta_hat[j] * x_innovations[j][t];

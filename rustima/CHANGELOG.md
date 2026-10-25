@@ -5,6 +5,21 @@ Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
 ## Unreleased
 
+- Fix `simple_differencing=True` with exogenous regressors: forecasts now difference
+  the future exog like the fitted regressors (they were used in levels), and OPG
+  standard errors run on the differenced series with the matching `n_eff`. A new
+  core test pins `simple_differencing=True` on (y, x) to the plain model on (Δy, Δx).
+- One set of validation rules, in Rust (`SarimaxModel::new`). Python now follows the
+  core bounds (`d <= 3`, `D <= 2` where the state space allows it, trend `"tc"`
+  accepted, no minimum series length at construction); parameter names come from the
+  core. R: `coef()` returns a named vector; one invalid series in `sarimax_batch()` /
+  `sarimax_grid_search()` is one error entry instead of failing the whole call;
+  `sarimax_batch_fit`/`sarimax_grid_search` (Python) reject unknown method names up front.
+- Optimizer method names are parsed once into an enum; `maxiter=0` results for
+  `"nm"` are labelled `"nelder-mead"` like every other Nelder-Mead result.
+- Loglike and analytical score now share one steady-state detector, so the gradient
+  freezes the Kalman recursion at the same step as the likelihood (gradients move by
+  ≤1e-9 relative; the likelihood is bit-identical).
 - Replace argmin's L-BFGS, BFGS and Nelder-Mead solvers with Basin 3.0, including
   CSS initialization and fallback refinement. Preserve API names, BFGS diagonal
   preconditioning and simplex construction, and remove argmin dependencies.

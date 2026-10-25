@@ -1,6 +1,7 @@
 use nalgebra::{DMatrix, DVector};
 
 use crate::error::{Result, SarimaxError};
+use crate::filter_policy::{f_usable, SteadyStateDetector, KF_FT_FALLBACK_VARIANCE};
 use crate::initialization::KalmanInit;
 use crate::state_space::StateSpace;
 
@@ -38,6 +39,8 @@ pub struct KalmanFilterOutput {
     pub predicted_state: DVector<f64>,
     /// Final predicted covariance P_{n+1|n}.
     pub predicted_cov: DMatrix<f64>,
+    /// Step at which the covariance recursion was frozen at its steady state, if it was.
+    pub period_converged: Option<usize>,
 }
 
 /// Predicted-state snapshot captured mid-filter at a rolling-forecast origin.
@@ -55,26 +58,6 @@ pub struct StateSnapshot {
     /// Predicted covariance P_{origin|origin-1}.
     pub predicted_cov: DMatrix<f64>,
 }
-
-/// Steady-state convergence tolerance for the gain vector pz = P*Z.
-///
-/// We check pz convergence (k-vector) because F_t = Z'*pz (scalar) can
-/// converge while pz changes in directions orthogonal to Z, leading to
-/// incorrect cached K_inf = T*pz/F. Error analysis shows the loglike
-/// error from a converged-but-imprecise K_inf is O(eps * n^2) due to
-/// compounding through the state recursion (unit-root states integrate
-/// the error), so eps must be tight.
-///
-/// At 1e-9, loglike error stays below ~1e-5 for n=1000.
-/// For models where pz converges slowly, steady-state won't trigger
-/// and the sparse T*P*T' path provides the primary speedup instead.
-pub(crate) const STEADY_STATE_TOL: f64 = 1e-9;
-
-/// Minimum steps past burn-in before checking for convergence.
-pub(crate) const STEADY_STATE_MIN_STEPS: usize = 5;
-
-/// Number of consecutive converged pz values required.
-pub(crate) const STEADY_STATE_CONSEC: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Sparse T representation for optimized matrix operations
@@ -344,33 +327,24 @@ struct SteadyStateCache {
     pz_inf: DVector<f64>,
 }
 
-/// Check pz-vector based convergence for steady-state detection.
-///
-/// Returns true if convergence criterion is met for STEADY_STATE_CONSEC
-/// consecutive steps.
-#[inline]
-pub(crate) fn check_convergence(
-    pz: &DVector<f64>,
-    pz_prev: &DVector<f64>,
-    consec_count: &mut usize,
-) -> bool {
-    let pz_diff_sq: f64 = pz
-        .iter()
-        .zip(pz_prev.iter())
-        .map(|(a, b)| {
-            let d = a - b;
-            d * d
-        })
-        .sum();
-    let pz_norm_sq: f64 = pz_prev.iter().map(|v| v * v).sum();
-    let pz_norm = pz_norm_sq.sqrt().max(1e-15);
-
-    if pz_diff_sq.sqrt() / pz_norm < STEADY_STATE_TOL {
-        *consec_count += 1;
-        *consec_count >= STEADY_STATE_CONSEC
-    } else {
-        *consec_count = 0;
-        false
+impl SteadyStateCache {
+    /// Freeze the recursion at `pz_inf` = P_inf·Z with `f_steady` = Z'·pz_inf.
+    fn new(
+        f_steady: f64,
+        pz_inf: &DVector<f64>,
+        strategy: &KalmanStrategy,
+        t_mat: &DMatrix<f64>,
+        sparse_t: &SparseT,
+    ) -> Self {
+        // K_inf = T * pz_inf
+        let mut k_gain = DVector::<f64>::zeros(pz_inf.len());
+        strategy.compute_k_gain(t_mat, sparse_t, pz_inf, &mut k_gain);
+        Self {
+            k_gain,
+            f_steady,
+            log_f_steady: f_steady.ln(),
+            pz_inf: pz_inf.clone(),
+        }
     }
 }
 
@@ -467,10 +441,9 @@ fn kalman_core(
     let mut temp_kk = DMatrix::<f64>::zeros(k, k);
 
     // Steady-state detection: the cache is populated during the filter
-    // once the covariance recursion converges (see check_convergence).
+    // once the covariance recursion converges (see filter_policy::SteadyStateDetector).
     let mut ss_cache: Option<SteadyStateCache> = None;
-    let mut pz_prev = DVector::<f64>::zeros(k);
-    let mut consec_count = 0_usize;
+    let mut detector = SteadyStateDetector::new(k);
 
     for t in 0..n {
         // --- Rolling-origin snapshot: (a_{t|t-1}, P_{t|t-1}) at loop top ---
@@ -537,7 +510,7 @@ fn kalman_core(
                 innovation_vars.push(f_t);
             }
 
-            if f_t > 0.0 {
+            if f_usable(f_t) {
                 let f_inv = 1.0 / f_t;
 
                 // State update: a = a + (v_t / F_t) * pz
@@ -573,32 +546,9 @@ fn kalman_core(
                     sum_v2_f += v_t * v_t * f_inv;
                 }
 
-                // --- Steady-state convergence check (pz-vector based) ---
-                if t >= burn + STEADY_STATE_MIN_STEPS {
-                    // Compute pz from the PREDICTED P (already updated above)
-                    pz.gemv(1.0, &p, z, 0.0);
-
-                    if check_convergence(&pz, &pz_prev, &mut consec_count) {
-                        let f_steady = z.dot(&pz);
-                        // Guard: only adopt steady-state if F_inf is positive and finite
-                        if f_steady > 0.0 && f_steady.is_finite() {
-                            let log_f_steady = f_steady.ln();
-                            let pz_inf = pz.clone();
-
-                            // K_inf = T * pz_inf
-                            let mut k_gain = DVector::<f64>::zeros(k);
-                            strategy.compute_k_gain(t_mat, &sparse_t, &pz, &mut k_gain);
-
-                            ss_cache = Some(SteadyStateCache {
-                                k_gain,
-                                f_steady,
-                                log_f_steady,
-                                pz_inf,
-                            });
-                        }
-                        // else: pz converged but F_inf invalid — stay on non-converged path
-                    }
-                    pz_prev.copy_from(&pz);
+                // --- Steady-state convergence check (shared detector, see filter_policy) ---
+                if let Some(f_steady) = detector.observe(t, burn, &p, z, &mut pz) {
+                    ss_cache = Some(SteadyStateCache::new(f_steady, &pz, &strategy, t_mat, &sparse_t));
                 }
             } else {
                 // SAFEGUARD (numerical wall at parameter boundary).
@@ -618,7 +568,7 @@ fn kalman_core(
                 // but is finite and smooth in the parameters, so gradient
                 // descent can still steer back into a stable basin.
                 if t >= burn {
-                    let f_safe: f64 = crate::optimizer::KF_FT_FALLBACK_VARIANCE;
+                    let f_safe: f64 = KF_FT_FALLBACK_VARIANCE;
                     sum_log_f += f_safe.ln();
                     sum_v2_f += v_t * v_t / f_safe;
                 }
@@ -706,6 +656,7 @@ fn kalman_core(
         filtered_cov: p_filtered,
         predicted_state: a,
         predicted_cov: p,
+        period_converged: detector.onset,
     })
 }
 
@@ -882,10 +833,9 @@ pub fn kalman_filter_batched(
 
     // Steady-state cache (identical for every series because it depends
     // only on T, Z, R, Q, P_0). Populated during the filter once the
-    // covariance recursion converges (see check_convergence).
+    // covariance recursion converges (see filter_policy::SteadyStateDetector).
     let mut ss_cache: Option<SteadyStateCache> = None;
-    let mut pz_prev = DVector::<f64>::zeros(k);
-    let mut consec_count = 0_usize;
+    let mut detector = SteadyStateDetector::new(k);
 
     for t in 0..n {
         let d_t = if t < ss.obs_intercept.len() {
@@ -923,7 +873,7 @@ pub fn kalman_filter_batched(
             let f_t = strategy.compute_pz_and_f(&p, z, &sparse_z, &sparse_t, &mut pz);
             innovation_vars.push(f_t);
 
-            if f_t > 0.0 {
+            if f_usable(f_t) {
                 let f_inv = 1.0 / f_t;
 
                 // Per-series mean update + predict.
@@ -945,25 +895,9 @@ pub fn kalman_filter_batched(
                 p.ger(-f_inv, &pz, &pz, 1.0);
                 strategy.predict_cov(t_mat, &t_mat_t, &sparse_t, &mut p, &rqr, &mut temp_kk);
 
-                // Steady-state convergence check (covariance only).
-                if t >= burn + STEADY_STATE_MIN_STEPS {
-                    pz.gemv(1.0, &p, z, 0.0);
-                    if check_convergence(&pz, &pz_prev, &mut consec_count) {
-                        let f_steady = z.dot(&pz);
-                        if f_steady > 0.0 && f_steady.is_finite() {
-                            let log_f_steady = f_steady.ln();
-                            let pz_inf = pz.clone();
-                            let mut k_gain = DVector::<f64>::zeros(k);
-                            strategy.compute_k_gain(t_mat, &sparse_t, &pz, &mut k_gain);
-                            ss_cache = Some(SteadyStateCache {
-                                k_gain,
-                                f_steady,
-                                log_f_steady,
-                                pz_inf,
-                            });
-                        }
-                    }
-                    pz_prev.copy_from(&pz);
+                // Steady-state convergence check (covariance only; shared detector).
+                if let Some(f_steady) = detector.observe(t, burn, &p, z, &mut pz) {
+                    ss_cache = Some(SteadyStateCache::new(f_steady, &pz, &strategy, t_mat, &sparse_t));
                 }
             } else {
                 // F_t <= 0: replicate single-series behaviour — skip the

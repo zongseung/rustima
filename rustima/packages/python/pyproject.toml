@@ -85,6 +85,3 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["python"]
-markers = [
-    "nightly: marks tests as nightly-only (deselect with '-m \"not nightly\"')",
-]

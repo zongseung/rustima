@@ -27,9 +27,9 @@ From this directory, with Rust >= 1.87:
 cargo test -p rustima-core --all-targets --locked
 
 # Python >= 3.10; activate a virtual environment first.
-python -m pip install maturin numpy polars pytest scipy statsmodels pandas
+python -m pip install maturin numpy polars pytest
 maturin develop --release --manifest-path packages/python/Cargo.toml
-python -m pytest packages/python/tests -o pythonpath= -m 'not nightly'
+python -m pytest packages/python/tests -o pythonpath=
 
 # R >= 4.2, Cargo/rustc and the platform's R build tools must be installed.
 python3 tools/build_r_package.py

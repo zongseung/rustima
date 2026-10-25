@@ -17,59 +17,6 @@ def _hqic(llf, n_params, n_obs):
     return -2.0 * llf + 2.0 * n_params * math.log(math.log(n_obs))
 
 
-def _generate_param_names(order, seasonal_order, n_exog=0, concentrate_scale=False, trend="n"):
-    """Generate statsmodels-style parameter names from model specification.
-
-    Layout: [trend(kt) | exog(k) | ar(p) | ma(q) | sar(P) | sma(Q) | sigma2?]
-
-    Parameters
-    ----------
-    order : tuple (p, d, q)
-    seasonal_order : tuple (P, D, Q, s)
-    n_exog : int
-    concentrate_scale : bool
-    trend : str
-
-    Returns
-    -------
-    list[str]
-    """
-    p, _d, q = order
-    P, _D, Q, s = seasonal_order
-    names = []
-
-    # Trend
-    if trend in ("c", "ct"):
-        names.append("intercept")
-    if trend in ("t", "ct"):
-        names.append("drift")
-
-    # Exogenous
-    for i in range(1, n_exog + 1):
-        names.append(f"x{i}")
-
-    # AR
-    for i in range(1, p + 1):
-        names.append(f"ar.L{i}")
-
-    # MA
-    for i in range(1, q + 1):
-        names.append(f"ma.L{i}")
-
-    # Seasonal AR
-    for i in range(1, P + 1):
-        names.append(f"ar.S.L{i * s}")
-
-    # Seasonal MA
-    for i in range(1, Q + 1):
-        names.append(f"ma.S.L{i * s}")
-
-    # sigma2 (only when not concentrated)
-    if not concentrate_scale:
-        names.append("sigma2")
-
-    return names
-
 
 # ---------------------------------------------------------------------------
 # Numerical inference helpers
@@ -96,18 +43,6 @@ def _norm_ppf(p):
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
     return t - (c0 + c1 * t + c2 * t**2) / (1.0 + d1 * t + d2 * t**2 + d3 * t**3)
-
-
-def _norm_cdf(x):
-    """Standard normal CDF.
-
-    Uses scipy if available, otherwise math.erf.
-    """
-    try:
-        from scipy.stats import norm
-        return norm.cdf(x)
-    except ImportError:
-        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def _inference_nan_dict(k, status, message, prefix=""):
@@ -275,26 +210,16 @@ def _compute_statsmodels_inference(endog, order, seasonal_order, alpha=0.05,
         raise
 
 
-def _compute_rust_inference(endog, order, seasonal_order, params, method, alpha=0.05,
-                            exog=None, enforce_stationarity=True,
-                            enforce_invertibility=True, trend="n",
-                            simple_differencing=False):
+def _compute_rust_inference(model, params, method, alpha=0.05):
     """Compute inference using the Rust sarimax_inference function.
 
     Parameters
     ----------
-    endog : np.ndarray
-    order : tuple (p, d, q)
-    seasonal_order : tuple (P, D, Q, s)
+    model : SARIMAXModel
     params : np.ndarray
     method : str
         "hessian" or "opg".
     alpha : float
-    exog : np.ndarray or None
-    enforce_stationarity : bool
-    enforce_invertibility : bool
-    trend : str
-    simple_differencing : bool
 
     Returns
     -------
@@ -305,20 +230,10 @@ def _compute_rust_inference(endog, order, seasonal_order, params, method, alpha=
     nan_arr = np.full(k, np.nan)
 
     try:
-        kwargs = dict(
-            method=method, alpha=alpha,
-            enforce_stationarity=enforce_stationarity,
-            enforce_invertibility=enforce_invertibility,
-            trend=trend,
-            simple_differencing=simple_differencing,
-        )
-        if exog is not None:
-            kwargs["exog"] = exog
-
         result = rustima.sarimax_inference(
-            endog, order, seasonal_order,
+            model.endog, model.order, model.seasonal_order,
             np.array(params, dtype=np.float64),
-            **kwargs,
+            **model._model_kwargs(method=method, alpha=alpha),
         )
 
         return dict(
@@ -389,7 +304,8 @@ class SARIMAXModel:
         enforce_invertibility=True,
         simple_differencing=False,
     ):
-        # --- endog validation ---
+        # Python checks only what Rust cannot see (array shape and element types).
+        # Order bounds, trend, exog shape and finiteness are validated once, in Rust.
         # np.asarray silently DROPS the mask of a masked array and treats
         # masked entries as raw data — reject rather than compute on garbage.
         if np.ma.isMaskedArray(endog) or np.ma.isMaskedArray(exog):
@@ -399,42 +315,18 @@ class SARIMAXModel:
         self.endog = np.asarray(endog, dtype=np.float64)
         if self.endog.ndim != 1:
             raise ValueError(f"endog must be 1-dimensional, got ndim={self.endog.ndim}")
-        if len(self.endog) < 10:
-            raise ValueError(f"endog too short: {len(self.endog)} < 10")
-        if not np.isfinite(self.endog).all():
-            raise ValueError("endog contains NaN or Inf values")
-
-        # --- order validation ---
         if len(order) != 3:
             raise ValueError(f"order must have 3 elements (p,d,q), got {len(order)}")
-        p, d, q = order
-        if not all(isinstance(v, (int, np.integer)) and v >= 0 for v in (p, d, q)):
+        if not all(isinstance(v, (int, np.integer)) and v >= 0 for v in order):
             raise ValueError(f"order (p,d,q) must be non-negative integers, got {order}")
-        if d > 2:
-            raise ValueError(f"Non-seasonal differencing d must be <= 2, got d={d}")
-
-        # --- seasonal_order validation ---
         if len(seasonal_order) != 4:
             raise ValueError(
                 f"seasonal_order must have 4 elements (P,D,Q,s), got {len(seasonal_order)}"
             )
-        P, D, Q, s = seasonal_order
-        if not all(isinstance(v, (int, np.integer)) and v >= 0 for v in (P, D, Q, s)):
+        if not all(isinstance(v, (int, np.integer)) and v >= 0 for v in seasonal_order):
             raise ValueError(
                 f"seasonal_order (P,D,Q,s) must be non-negative integers, got {seasonal_order}"
             )
-        if D > 1:
-            raise ValueError(f"Seasonal differencing D must be 0 or 1, got D={D}")
-        if s < 0:
-            raise ValueError(f"Seasonal period s must be non-negative, got s={s}")
-        if s == 1:
-            raise ValueError("Seasonal period s=1 is equivalent to s=0 (non-seasonal)")
-
-        # --- trend validation ---
-        if trend not in ("n", "c", "t", "ct"):
-            raise ValueError(f"trend must be one of 'n','c','t','ct', got {trend!r}")
-
-        # --- simple_differencing validation ---
         if not isinstance(simple_differencing, (bool, np.bool_)):
             raise TypeError(
                 f"simple_differencing must be bool, got {type(simple_differencing).__name__}"
@@ -442,26 +334,22 @@ class SARIMAXModel:
 
         self.order = order
         self.seasonal_order = seasonal_order
-
-        # --- exog validation ---
+        self.exog = None
         if exog is not None:
             self.exog = np.asarray(exog, dtype=np.float64)
             if self.exog.ndim == 1:
                 self.exog = self.exog.reshape(-1, 1)
-            if self.exog.shape[0] != len(self.endog):
-                raise ValueError(
-                    f"exog row count {self.exog.shape[0]} != endog length {len(self.endog)}"
-                )
-            if not np.isfinite(self.exog).all():
-                raise ValueError("exog contains NaN or Inf values")
-        else:
-            self.exog = None
-
         self.trend = trend
         self.enforce_stationarity = enforce_stationarity
         self.enforce_invertibility = enforce_invertibility
         self.simple_differencing = simple_differencing
         self._fit_result = None
+
+        info = rustima._model_info(
+            self.endog, self.order, self.seasonal_order, **self._model_kwargs()
+        )
+        self.param_names = info["param_names"]
+        self._n_obs_eff = info["n_obs"]
 
     @property
     def nobs(self):
@@ -536,9 +424,7 @@ class SARIMAXModel:
             ``result.method == "filter"``, ``converged == True``.
         """
         params = np.ascontiguousarray(np.asarray(params, dtype=np.float64).ravel())
-        expected_names = _generate_param_names(
-            self.order, self.seasonal_order, self.n_exog, trend=self.trend
-        )
+        expected_names = self.param_names
         if len(params) != len(expected_names):
             raise ValueError(
                 f"params length {len(params)} != expected {len(expected_names)} "
@@ -556,9 +442,7 @@ class SARIMAXModel:
         )
 
         k = len(params)
-        _p, d, _q = self.order
-        _P, D, _Q, s = self.seasonal_order
-        n_eff = self.nobs - ((d + s * D) if self.simple_differencing else 0)
+        n_eff = self._n_obs_eff
         sigma2_idx = expected_names.index("sigma2")
 
         result_dict = {
@@ -619,12 +503,7 @@ class SARIMAXResult:
     @property
     def param_names(self):
         """Parameter names matching the params vector."""
-        names = _generate_param_names(
-            self.model.order,
-            self.model.seasonal_order,
-            n_exog=self.model.n_exog,
-            trend=self.model.trend,
-        )
+        names = self.model.param_names
         # A mismatch means the Rust param layout and the Python naming have
         # drifted — padding with param_N here would print values under the
         # WRONG names in summary()/params_table() (DIAGNOSIS_V9 S5).
@@ -662,17 +541,7 @@ class SARIMAXResult:
         if cache_key not in self._inference_cache:
             rust_method = "hessian" if mode == "rust_hessian" else "opg"
             self._inference_cache[cache_key] = _compute_rust_inference(
-                self.model.endog,
-                self.model.order,
-                self.model.seasonal_order,
-                self.params,
-                method=rust_method,
-                alpha=alpha,
-                exog=self.model.exog,
-                enforce_stationarity=self.model.enforce_stationarity,
-                enforce_invertibility=self.model.enforce_invertibility,
-                trend=self.model.trend,
-                simple_differencing=self.model.simple_differencing,
+                self.model, self.params, method=rust_method, alpha=alpha
             )
         return self._inference_cache[cache_key]
 
@@ -852,8 +721,6 @@ class SARIMAXResult:
         -------
         ForecastResult
         """
-        if not (0 < alpha < 1):
-            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
         kwargs = self._rs_kwargs(steps=steps, alpha=alpha)
         if exog is not None:
             exog = np.asarray(exog, dtype=np.float64)

@@ -6,7 +6,14 @@ All tests must complete in <5s and must NOT require statsmodels.
 """
 
 import numpy as np
-import pytest
+
+
+def _ar1(n=100, phi=0.5, seed=42):
+    rng = np.random.default_rng(seed)
+    y = np.zeros(n)
+    for t in range(1, n):
+        y[t] = phi * y[t - 1] + rng.normal()
+    return y
 
 
 def test_import():
@@ -37,8 +44,7 @@ def test_public_api_surface():
 def test_basic_fit():
     """AR(1) fit completes and converges."""
     import rustima
-    from conftest import generate_ar1_rng
-    y = generate_ar1_rng(n=100, phi=0.5, seed=42)
+    y = _ar1()
     result = rustima.sarimax_fit(y, (1, 0, 0), (0, 0, 0, 0))
     assert result["converged"]
     assert np.isfinite(result["loglike"])
@@ -47,8 +53,7 @@ def test_basic_fit():
 def test_basic_forecast():
     """Forecast produces finite values of correct length."""
     import rustima
-    from conftest import generate_ar1_rng
-    y = generate_ar1_rng(n=100, phi=0.5, seed=42)
+    y = _ar1()
     result = rustima.sarimax_fit(y, (1, 0, 0), (0, 0, 0, 0))
     fc = rustima.sarimax_forecast(
         y, (1, 0, 0), (0, 0, 0, 0), np.array(result["params"]), steps=10,
@@ -68,8 +73,7 @@ def test_batch_fit_length():
 def test_model_wrapper_end_to_end():
     """SARIMAXModel fit + forecast end-to-end."""
     from rustima import SARIMAXModel
-    from conftest import generate_ar1_rng
-    y = generate_ar1_rng(n=100, phi=0.5, seed=42)
+    y = _ar1()
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     assert result.converged
     fc = result.forecast(steps=5)
@@ -81,15 +85,10 @@ def test_model_wrapper_end_to_end():
 # Model wrapper detailed tests (merged from test_model.py)
 # ---------------------------------------------------------------------------
 
-def _make_ar1():
-    from conftest import generate_ar1
-    return generate_ar1()
-
-
 def test_model_get_forecast_alias():
     """get_forecast() should produce identical results to forecast()."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     f1 = result.forecast(steps=5)
     f2 = result.get_forecast(steps=5)
@@ -100,7 +99,7 @@ def test_model_get_forecast_alias():
 def test_model_residuals():
     """result.resid should have length > 0 and finite values."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     resid = result.resid
     assert len(resid) > 0
@@ -110,7 +109,7 @@ def test_model_residuals():
 def test_model_summary_string():
     """summary() should contain expected keywords."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     s = result.summary()
     assert isinstance(s, str)
@@ -121,7 +120,7 @@ def test_model_summary_string():
 def test_model_aic_bic():
     """AIC and BIC should be finite floats."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     assert isinstance(result.aic, float) and np.isfinite(result.aic)
     assert isinstance(result.bic, float) and np.isfinite(result.bic)
@@ -130,7 +129,7 @@ def test_model_aic_bic():
 def test_model_conf_int():
     """conf_int() should return (steps, 2) shaped array with lower <= upper."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     ci = result.forecast(steps=7).conf_int()
     assert ci.shape == (7, 2)
@@ -142,7 +141,7 @@ def test_model_matches_raw_api():
     """SARIMAXModel results should match rustima raw API."""
     import rustima
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     result = SARIMAXModel(y, order=(1, 0, 0)).fit()
     raw = rustima.sarimax_fit(y, (1, 0, 0), (0, 0, 0, 0))
     assert abs(result.llf - raw["loglike"]) < 1e-10
@@ -152,7 +151,7 @@ def test_model_matches_raw_api():
 def test_forecast_result_attributes():
     """ForecastResult should have predicted_mean, variance, ci_lower, ci_upper."""
     from rustima.model import SARIMAXModel
-    y = _make_ar1()
+    y = _ar1(200, 0.7)
     fcast = SARIMAXModel(y, order=(1, 0, 0)).fit().forecast(steps=3)
     for attr in ("predicted_mean", "variance", "ci_lower", "ci_upper"):
         assert hasattr(fcast, attr)

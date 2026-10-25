@@ -17,11 +17,10 @@ use nalgebra::DMatrix;
 use statrs::distribution::{ChiSquared, ContinuousCDF, FisherSnedecor, Normal};
 
 use crate::error::{Result, SarimaxError};
-use crate::initialization::KalmanInit;
+use crate::model::Prepared;
 use crate::optimizer::untransform_params;
 use crate::params::SarimaxParams;
 use crate::score;
-use crate::state_space::StateSpace;
 use crate::types::SarimaxConfig;
 
 // ---------------------------------------------------------------------------
@@ -70,7 +69,7 @@ pub struct DiagnosticsResult {
 // ---------------------------------------------------------------------------
 
 /// Compute inference using the specified method ("hessian" or "opg").
-pub fn compute_inference(
+pub(crate) fn compute_inference(
     endog: &[f64],
     config: &SarimaxConfig,
     constrained_params: &[f64],
@@ -95,16 +94,17 @@ pub fn compute_inference(
         });
     }
 
+    let data = Prepared::new(endog, exog, config)?;
     let info = match method {
         "hessian" => {
-            let hess = numerical_hessian(endog, config, constrained_params, exog)?;
+            let hess = numerical_hessian(&data, constrained_params)?;
             // Information matrix = -Hessian (in constrained space after chain rule)
             -hess
         }
         "opg" => {
-            let opg = opg_information_matrix(endog, config, constrained_params, exog)?;
+            let opg = opg_information_matrix(&data, constrained_params)?;
             // Scale by n_eff (matching statsmodels convention)
-            let n_eff = compute_n_eff(endog, config)?;
+            let n_eff = compute_n_eff(&data)?;
             opg * n_eff as f64
         }
         _ => {
@@ -133,17 +133,13 @@ pub fn compute_inference(
 /// 1. Untransform to unconstrained space
 /// 2. Central-difference Hessian in unconstrained space
 /// 3. Chain rule: H_constrained = J^T · H_unconstrained · J
-pub fn numerical_hessian(
-    endog: &[f64],
-    config: &SarimaxConfig,
-    constrained_params: &[f64],
-    exog: Option<&[Vec<f64>]>,
-) -> Result<DMatrix<f64>> {
+pub(crate) fn numerical_hessian(data: &Prepared, constrained_params: &[f64]) -> Result<DMatrix<f64>> {
+    let config = data.config();
     let k = constrained_params.len();
     let unconstrained = untransform_params(constrained_params, config)?;
 
     // Base loglike
-    let f0 = eval_loglike_at_unconstrained(&unconstrained, config, endog, exog)?;
+    let f0 = eval_loglike_at_unconstrained(&unconstrained, data)?;
 
     // Step sizes
     let h: Vec<f64> = unconstrained
@@ -160,9 +156,9 @@ pub fn numerical_hessian(
         let mut x_m = unconstrained.clone();
         x_p[i] += h[i];
         x_m[i] -= h[i];
-        f_plus[i] = eval_loglike_at_unconstrained(&x_p, config, endog, exog)
+        f_plus[i] = eval_loglike_at_unconstrained(&x_p, data)
             .unwrap_or(f64::NAN);
-        f_minus[i] = eval_loglike_at_unconstrained(&x_m, config, endog, exog)
+        f_minus[i] = eval_loglike_at_unconstrained(&x_m, data)
             .unwrap_or(f64::NAN);
     }
 
@@ -191,13 +187,13 @@ pub fn numerical_hessian(
             x_mm[j] -= h[j];
 
             let f_pp =
-                eval_loglike_at_unconstrained(&x_pp, config, endog, exog).unwrap_or(f64::NAN);
+                eval_loglike_at_unconstrained(&x_pp, data).unwrap_or(f64::NAN);
             let f_pm =
-                eval_loglike_at_unconstrained(&x_pm, config, endog, exog).unwrap_or(f64::NAN);
+                eval_loglike_at_unconstrained(&x_pm, data).unwrap_or(f64::NAN);
             let f_mp =
-                eval_loglike_at_unconstrained(&x_mp, config, endog, exog).unwrap_or(f64::NAN);
+                eval_loglike_at_unconstrained(&x_mp, data).unwrap_or(f64::NAN);
             let f_mm =
-                eval_loglike_at_unconstrained(&x_mm, config, endog, exog).unwrap_or(f64::NAN);
+                eval_loglike_at_unconstrained(&x_mm, data).unwrap_or(f64::NAN);
 
             let val = (f_pp - f_pm - f_mp + f_mm) / (4.0 * h[i] * h[j]);
             hess_unc[(i, j)] = val;
@@ -231,24 +227,19 @@ pub fn numerical_hessian(
 /// Compute OPG information matrix from per-observation scores.
 ///
 /// Returns: I_OPG = (1/n_eff) · Σ s_t · s_t^T
-pub fn opg_information_matrix(
-    endog: &[f64],
-    config: &SarimaxConfig,
-    constrained_params: &[f64],
-    exog: Option<&[Vec<f64>]>,
-) -> Result<DMatrix<f64>> {
+pub(crate) fn opg_information_matrix(data: &Prepared, constrained_params: &[f64]) -> Result<DMatrix<f64>> {
+    let config = data.config();
     let sparams = SarimaxParams::from_flat(constrained_params, config)?;
-    let ss = StateSpace::new(config, &sparams, endog, exog)?;
-    let init = KalmanInit::from_config_default(&ss, config);
+    let (ss, init) = data.system(&sparams)?;
 
     let scores = score::score_obs(
-        endog,
+        data.endog(),
         &ss,
         &init,
         config,
         &sparams,
         config.concentrate_scale,
-        exog,
+        data.exog(),
     )?;
 
     let k = constrained_params.len();
@@ -400,7 +391,7 @@ fn inference_from_information(
 // ---------------------------------------------------------------------------
 
 /// Compute diagnostic tests on standardized residuals.
-pub fn compute_diagnostics(resid: &[f64], n_params: usize) -> DiagnosticsResult {
+pub(crate) fn compute_diagnostics(resid: &[f64], n_params: usize) -> DiagnosticsResult {
     // Precompute shared moments to avoid redundant O(n) passes
     let n = resid.len();
     let mean = if n > 0 { resid.iter().sum::<f64>() / n as f64 } else { 0.0 };
@@ -543,14 +534,9 @@ fn heteroskedasticity_breakvar(resid: &[f64]) -> (f64, f64) {
 // ---------------------------------------------------------------------------
 
 /// Evaluate loglike at given unconstrained parameters.
-fn eval_loglike_at_unconstrained(
-    unconstrained: &[f64],
-    config: &SarimaxConfig,
-    endog: &[f64],
-    exog: Option<&[Vec<f64>]>,
-) -> Result<f64> {
-    let output =
-        crate::pipeline::kalman_eval_unconstrained(endog, unconstrained, config, exog)?;
+fn eval_loglike_at_unconstrained(unconstrained: &[f64], data: &Prepared) -> Result<f64> {
+    let constrained = crate::optimizer::transform_params(unconstrained, data.config())?;
+    let output = data.loglike(&SarimaxParams::from_flat(&constrained, data.config())?)?;
     if output.loglike.is_finite() {
         Ok(output.loglike)
     } else {
@@ -585,11 +571,11 @@ fn safe_inverse(mat: &DMatrix<f64>) -> (DMatrix<f64>, bool) {
     }
 }
 
-/// Compute n_eff = n - burn for the model.
-fn compute_n_eff(endog: &[f64], config: &SarimaxConfig) -> Result<usize> {
-    let n = endog.len();
-    let sd = config.order.k_states_diff();
-    let burn = if config.simple_differencing { 0 } else { sd };
+/// Compute n_eff = n - burn for the model (`n` is already the differenced length
+/// under simple_differencing, so no burn applies there).
+fn compute_n_eff(data: &Prepared) -> Result<usize> {
+    let n = data.endog().len();
+    let burn = data.config().effective_sd();
     if n <= burn {
         return Err(SarimaxError::DataError(format!(
             "n={} <= burn={}",
@@ -634,7 +620,7 @@ mod tests {
         let fit = crate::optimizer::fit(&data, &config, None, Some("lbfgsb"), Some(200), None)
             .expect("fit should succeed");
 
-        let hess = numerical_hessian(&data, &config, &fit.params, None)
+        let hess = numerical_hessian(&Prepared::new(&data, None, &config).unwrap(), &fit.params)
             .expect("hessian should succeed");
 
         let k = fit.params.len();
@@ -662,7 +648,7 @@ mod tests {
         let fit = crate::optimizer::fit(&data, &config, None, Some("lbfgsb"), Some(200), None)
             .expect("fit should succeed");
 
-        let hess = numerical_hessian(&data, &config, &fit.params, None)
+        let hess = numerical_hessian(&Prepared::new(&data, None, &config).unwrap(), &fit.params)
             .expect("hessian should succeed");
 
         let k = fit.params.len();

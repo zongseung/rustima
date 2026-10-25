@@ -1,20 +1,22 @@
-//! Multi-start orchestration and per-method fit dispatch wrappers.
+//! Multi-start orchestration and per-method fit strategies.
 
 use rayon::prelude::*;
 
 use std::cell::RefCell;
 
-use crate::error::SarimaxError;
 use crate::types::SarimaxConfig;
 
-use super::lbfgsb::{MethodOutcome as LbfgsbMethodOutcome, RunError};
+use super::lbfgsb::{Method, MethodOutcome, Outcome, RunError};
 use super::objective::SarimaxObjective;
 use super::passes_cancellation_filter;
 use super::runners::{
     compute_bounds, consume_budget, run_bfgs, run_lbfgs, run_lbfgsb, run_nelder_mead,
-    MethodOutcome, RunOutcome,
 };
 use super::transforms::untransform_params;
+
+/// Incumbent: `(params, cost, converged, label)`.
+type Best = Option<(Vec<f64>, f64, bool, String)>;
+type Bounds = [(Option<f64>, Option<f64>)];
 
 // ---------------------------------------------------------------------------
 // Multi-start helpers (shared by lbfgsb-multi and lbfgs methods)
@@ -33,7 +35,7 @@ fn grid_ma_initialization(
     n_params_total: usize,
     remaining: &mut u64,
     total_work: &mut u64,
-    best: &mut Option<(Vec<f64>, f64, bool, String)>,
+    best: &mut Best,
     method_label: &str,
 ) {
     if !config.enforce_invertibility || config.order.qq == 0 || *remaining == 0 {
@@ -71,7 +73,7 @@ fn grid_ma_initialization(
 ///
 /// Uses a deterministic linear congruential generator (LCG) seeded at 12345
 /// for reproducible multi-start perturbations of the unconstrained start.
-pub(super) fn lcg_perturbed_starts(
+fn lcg_perturbed_starts(
     unconstrained_start: &[f64],
     n_restarts: usize,
     remaining: &u64,
@@ -98,13 +100,7 @@ pub(super) fn lcg_perturbed_starts(
 }
 
 /// Update `best` if `(p, c)` is better (lower cost) than the current best.
-fn try_update_best(
-    best: &mut Option<(Vec<f64>, f64, bool, String)>,
-    p: Vec<f64>,
-    c: f64,
-    conv: bool,
-    method_name: &str,
-) {
+fn try_update_best(best: &mut Best, p: Vec<f64>, c: f64, conv: bool, method_name: &str) {
     match best {
         Some((_, best_cost, _, _)) if c < *best_cost => {
             *best = Some((p, c, conv, method_name.to_string()));
@@ -114,6 +110,39 @@ fn try_update_best(
         }
         _ => {}
     }
+}
+
+/// Book a run's work (successful or not) and offer its result to `best`.
+fn consider(outcome: Outcome, label: &str, best: &mut Best, remaining: &mut u64, total_work: &mut u64) {
+    match outcome {
+        Ok((p, c, n, conv)) => {
+            consume_budget(remaining, total_work, n);
+            try_update_best(best, p, c, conv, label);
+        }
+        Err(error) => consume_budget(remaining, total_work, error.work),
+    }
+}
+
+/// Run L-BFGS-B from every start in parallel. Each rayon worker gets its own
+/// objective (fresh caches): `SarimaxObjective` holds `RefCell`s and is `!Sync`.
+fn par_lbfgsb(
+    objective: &SarimaxObjective,
+    starts: Vec<Vec<f64>>,
+    bounds: &Bounds,
+    budget: u64,
+) -> Vec<Outcome> {
+    let data = &objective.data;
+    starts
+        .into_par_iter()
+        .map(|start| {
+            let obj = SarimaxObjective {
+                data: data.clone(),
+                cache: RefCell::new(None),
+                ss_cache: RefCell::new(None),
+            };
+            run_lbfgsb(&obj, start, bounds.to_vec(), budget)
+        })
+        .collect()
 }
 
 /// NM refinement: try polishing the best solution with Nelder-Mead.
@@ -170,51 +199,57 @@ pub(super) fn compute_n_restarts(n_params_total: usize, config: &SarimaxConfig) 
     }
 }
 
-/// Generic multi-start optimizer with grid search and NM refinement.
+/// Multi-start: seed run, zero start, seasonal-MA grid (NM), LCG perturbations
+/// of the seed, then NM refinement of the incumbent; Nelder-Mead from the seed
+/// if nothing converged.
 ///
-/// Implements the shared orchestration logic for both L-BFGS-B and L-BFGS
-/// multi-start strategies. The `runner` closure encapsulates the specific
-/// optimizer (strategy pattern), taking `(start_params, maxiter)` and
-/// returning `(best_params, cost, n_evals, converged)`.
-fn fit_multistart<F>(
+/// `method` is `Lbfgs` (unbounded Basin L-BFGS, perturbations run sequentially)
+/// or `LbfgsbMulti` (bounded L-BFGS-B, perturbations run in parallel via rayon).
+pub(super) fn multistart(
+    method: Method,
     objective: &SarimaxObjective,
     unconstrained_start: &[f64],
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-    method_label: &str,
-    runner: F,
-) -> MethodOutcome
-where
-    F: Fn(Vec<f64>, u64) -> RunOutcome,
-{
+) -> MethodOutcome {
+    let bounds = compute_bounds(config);
+    let label = if method == Method::Lbfgs { "lbfgs" } else { "lbfgsb-multi" };
+    let run = |start: Vec<f64>, budget: u64| -> Outcome {
+        if method == Method::Lbfgs {
+            run_lbfgs(objective.clone(), start, budget).map_err(RunError::from)
+        } else {
+            run_lbfgsb(objective, start, bounds.clone(), budget)
+        }
+    };
     let n_params_total = unconstrained_start.len();
     let mut remaining = maxiter;
     let mut total_work: u64 = 0;
+    let mut best: Best = None;
 
-    // Initial optimizer run
-    let mut best: Option<(Vec<f64>, f64, bool, String)> =
-        match runner(unconstrained_start.to_vec(), remaining) {
-            Ok((p, c, n, conv)) => {
-                consume_budget(&mut remaining, &mut total_work, n);
-                Some((p, c, conv, method_label.to_string()))
-            }
-            Err(_) => None,
-        };
+    consider(
+        run(unconstrained_start.to_vec(), remaining),
+        label,
+        &mut best,
+        &mut remaining,
+        &mut total_work,
+    );
 
     if n_restarts > 0 && remaining > 0 {
         // 1. Zero-start
-        let zeros = vec![0.0; n_params_total];
-        if let Ok((p, c, n, conv)) = runner(zeros, remaining) {
-            consume_budget(&mut remaining, &mut total_work, n);
-            try_update_best(&mut best, p, c, conv, method_label);
-        }
+        consider(
+            run(vec![0.0; n_params_total], remaining),
+            label,
+            &mut best,
+            &mut remaining,
+            &mut total_work,
+        );
 
         // 2. Seasonal MA grid (NM, gradient-free for boundary avoidance)
-        let grid_label = if method_label.contains("lbfgsb") {
-            format!("{}+nm", method_label)
+        let grid_label = if method == Method::Lbfgs {
+            label.to_string()
         } else {
-            method_label.to_string()
+            format!("{label}+nm")
         };
         grid_ma_initialization(
             objective,
@@ -227,165 +262,33 @@ where
         );
 
         // 3. LCG perturbations (with P6 near-cancellation filter, α=0.01)
-        let perturbations = lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining);
-        for perturbed in perturbations {
-            if remaining == 0 {
-                break;
-            }
-            if !passes_cancellation_filter(&perturbed, config) {
-                continue; // reject near-cancellation start point
-            }
-            if let Ok((p, c, n, conv)) = runner(perturbed, remaining) {
-                consume_budget(&mut remaining, &mut total_work, n);
-                try_update_best(&mut best, p, c, conv, method_label);
-            }
-        }
-    }
-
-    match best {
-        Some((best_p, best_c, best_conv, method_name)) => Ok(nm_refinement(
-            objective,
-            best_p,
-            best_c,
-            best_conv,
-            method_name,
-            n_params_total,
-            &mut remaining,
-            &mut total_work,
-        )),
-        None => {
-            // All optimizer attempts failed, fallback to Nelder-Mead
-            let (p, c, n, conv) =
-                run_nelder_mead(objective.clone(), unconstrained_start.to_vec(), remaining)
-                    .map_err(SarimaxError::OptimizationFailed)?;
-            consume_budget(&mut remaining, &mut total_work, n);
-            Ok((p, c, total_work, conv, "nelder-mead (fallback)".to_string()))
-        }
-    }
-}
-
-/// Multi-start L-BFGS-B with grid search, parallel restarts, and NM refinement.
-///
-/// Uses rayon to parallelize LCG perturbation restarts. Each thread gets its
-/// own SarimaxObjective with independent StateSpace cache.
-pub(super) fn fit_lbfgsb_multi(
-    objective: &SarimaxObjective,
-    unconstrained_start: &[f64],
-    config: &SarimaxConfig,
-    maxiter: u64,
-    n_restarts: usize,
-) -> LbfgsbMethodOutcome {
-    let bounds = compute_bounds(config);
-    let n_params_total = unconstrained_start.len();
-    let mut remaining = maxiter;
-    let mut total_work: u64 = 0;
-
-    // Initial run (sequential)
-    let mut best: Option<(Vec<f64>, f64, bool, String)> = match run_lbfgsb(
-        objective,
-        unconstrained_start.to_vec(),
-        bounds.clone(),
-        remaining,
-    ) {
-        Ok((p, c, n, conv)) => {
-            consume_budget(&mut remaining, &mut total_work, n);
-            Some((p, c, conv, "lbfgsb-multi".to_string()))
-        }
-        Err(error) => {
-            consume_budget(&mut remaining, &mut total_work, error.work);
-            None
-        }
-    };
-
-    if n_restarts > 0 && remaining > 0 {
-        // 1. Zero-start (sequential)
-        let zeros = vec![0.0; n_params_total];
-        match run_lbfgsb(objective, zeros, bounds.clone(), remaining) {
-            Ok((p, c, n, conv)) => {
-                consume_budget(&mut remaining, &mut total_work, n);
-                try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
-            }
-            Err(error) => {
-                consume_budget(&mut remaining, &mut total_work, error.work);
-            }
-        }
-
-        // 2. Grid MA initialization (sequential NM, gradient-free)
-        grid_ma_initialization(
-            objective,
-            config,
-            n_params_total,
-            &mut remaining,
-            &mut total_work,
-            &mut best,
-            "lbfgsb-multi+nm",
-        );
-
-        // 3. LCG perturbations — PARALLEL via rayon (with P6 near-cancellation filter, α=0.01)
         let perturbations: Vec<_> =
             lcg_perturbed_starts(unconstrained_start, n_restarts, &remaining)
                 .into_iter()
                 .filter(|start| passes_cancellation_filter(start, config))
                 .collect();
         // Skip the rayon block in a fork()ed child — the inherited pool would deadlock (C1/C2).
-        if perturbations.len() >= 2 && remaining > 0 && crate::batch::guard_rayon_fork().is_ok() {
+        let parallel = method == Method::LbfgsbMulti
+            && perturbations.len() >= 2
+            && remaining > 0
+            && crate::batch::guard_rayon_fork().is_ok();
+        if parallel {
             let per_start_budget = remaining / perturbations.len() as u64;
             if per_start_budget > 0 {
-                // Pre-clone data for thread-safe parallel execution.
-                // Each rayon thread gets its own SarimaxObjective (with fresh caches).
-                let endog_shared = &objective.endog;
-                let config_shared = &objective.config;
-                let exog_shared = &objective.exog;
-                let bounds_shared = &bounds;
-
-                let results: Vec<_> = perturbations
-                    .into_par_iter()
-                    .map(|start| {
-                        let obj = SarimaxObjective {
-                            endog: endog_shared.clone(),
-                            config: config_shared.clone(),
-                            exog: exog_shared.clone(),
-                            cache: RefCell::new(None),
-                            ss_cache: RefCell::new(None),
-                        };
-                        run_lbfgsb(&obj, start, bounds_shared.clone(), per_start_budget)
-                    })
-                    .collect();
-
-                let par_work: u64 = results
-                    .iter()
-                    .map(|result| match result {
-                        Ok((_, _, n, _)) => *n,
-                        Err(error) => error.work,
-                    })
-                    .sum();
-                total_work = total_work.saturating_add(par_work);
-                remaining = remaining.saturating_sub(par_work);
-
-                for (p, c, _, conv) in results.into_iter().flatten() {
-                    try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
+                for outcome in par_lbfgsb(objective, perturbations, &bounds, per_start_budget) {
+                    consider(outcome, label, &mut best, &mut remaining, &mut total_work);
                 }
             }
         } else {
-            // Single perturbation or no budget: run sequentially
             for perturbed in perturbations {
                 if remaining == 0 {
                     break;
                 }
-                match run_lbfgsb(objective, perturbed, bounds.clone(), remaining) {
-                    Ok((p, c, n, conv)) => {
-                        consume_budget(&mut remaining, &mut total_work, n);
-                        try_update_best(&mut best, p, c, conv, "lbfgsb-multi");
-                    }
-                    Err(error) => {
-                        consume_budget(&mut remaining, &mut total_work, error.work);
-                    }
-                }
+                consider(run(perturbed, remaining), label, &mut best, &mut remaining, &mut total_work);
             }
         }
     }
 
-    // NM refinement
     match best {
         Some((best_p, best_c, best_conv, method_name)) => Ok(nm_refinement(
             objective,
@@ -404,6 +307,7 @@ pub(super) fn fit_lbfgsb_multi(
                     work: total_work,
                 });
             }
+            // All optimizer attempts failed, fallback to Nelder-Mead
             let (p, c, n, conv) =
                 run_nelder_mead(objective.clone(), unconstrained_start.to_vec(), remaining)
                     .map_err(|message| RunError {
@@ -416,50 +320,30 @@ pub(super) fn fit_lbfgsb_multi(
     }
 }
 
-/// Multi-start Basin L-BFGS with grid search and Nelder-Mead refinement.
-pub(super) fn fit_lbfgs_multi(
-    objective: &SarimaxObjective,
-    unconstrained_start: &[f64],
-    config: &SarimaxConfig,
-    maxiter: u64,
-    n_restarts: usize,
-) -> MethodOutcome {
-    let obj = objective.clone();
-    fit_multistart(
-        objective,
-        unconstrained_start,
-        config,
-        maxiter,
-        n_restarts,
-        "lbfgs",
-        |start, budget| run_lbfgs(obj.clone(), start, budget),
-    )
-}
-
-/// Single-run BFGS (no multi-start). Used as the standalone "bfgs" method.
+/// Single-run BFGS (no multi-start) with Nelder-Mead fallback.
 pub(super) fn fit_bfgs_single(
     objective: &SarimaxObjective,
     unconstrained_start: Vec<f64>,
-    _config: &SarimaxConfig,
     maxiter: u64,
 ) -> MethodOutcome {
     match run_bfgs(objective.clone(), unconstrained_start.clone(), maxiter) {
         Ok((p, c, n, conv)) => Ok((p, c, n, conv, "bfgs".to_string())),
         Err(_) => {
-            let (p, c, n, conv) = run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
-                .map_err(SarimaxError::OptimizationFailed)?;
+            let (p, c, n, conv) =
+                run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
+                    .map_err(RunError::from)?;
             Ok((p, c, n, conv, "nelder-mead (fallback)".to_string()))
         }
     }
 }
 
-/// Single-run L-BFGS-B with Nelder-Mead fallback.
+/// Single-run L-BFGS-B; on failure, escalates to multi-start with the remaining budget.
 pub(super) fn fit_lbfgsb_single(
     objective: &SarimaxObjective,
     unconstrained_start: Vec<f64>,
     config: &SarimaxConfig,
     maxiter: u64,
-) -> LbfgsbMethodOutcome {
+) -> MethodOutcome {
     let bounds = compute_bounds(config);
     match run_lbfgsb(objective, unconstrained_start.clone(), bounds, maxiter) {
         Ok((p, c, n, conv)) => Ok((p, c, n, conv, "lbfgsb".into())),
@@ -469,7 +353,8 @@ pub(super) fn fit_lbfgsb_single(
                 return Err(error);
             }
             let n_restarts = compute_n_restarts(unconstrained_start.len(), config);
-            match fit_lbfgsb_multi(
+            match multistart(
+                Method::LbfgsbMulti,
                 objective,
                 &unconstrained_start,
                 config,
@@ -484,6 +369,98 @@ pub(super) fn fit_lbfgsb_single(
                     Err(failure)
                 }
             }
+        }
+    }
+}
+
+/// Gradient-weighted perturbations around `anchor` (basin hopping).
+///
+/// Directions with large |∂L/∂θ_i| at the seed carry most of the loss-landscape
+/// information and are most likely to harbor distinct basins, so they are
+/// perturbed more aggressively; near-zero-gradient dimensions stay close to the
+/// anchor. The per-dimension scale is max(|seed|, |anchor|), floored, so exog
+/// coefficients that drifted far from their seed get proportionally wider
+/// exploration. With `nudge_seed`, the seed itself and a lightly kicked copy of
+/// it are added as candidates (they may sit in a different basin than the
+/// anchor). The LCG draw order is part of the contract: k·n hop draws, then the
+/// nudge draws.
+#[allow(clippy::too_many_arguments)]
+fn hop_candidates(
+    objective: &SarimaxObjective,
+    seed: &[f64],
+    anchor: &[f64],
+    config: &SarimaxConfig,
+    alpha: f64,
+    lcg_seed: u64,
+    k: usize,
+    nudge_seed: bool,
+) -> Vec<Vec<f64>> {
+    let n_dim = seed.len();
+    let grad = match objective.analytical_gradient_negloglike(seed) {
+        Ok(g) if g.len() == n_dim => g,
+        _ => vec![1.0; n_dim], // fall back to uniform perturbation
+    };
+    // Per-dim relative magnitudes ∈ [0, 1], floored so no dim is fully frozen
+    let max_abs = grad
+        .iter()
+        .map(|g| g.abs())
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
+    let rel_grad: Vec<f64> = grad.iter().map(|g| (g.abs() / max_abs).max(0.1)).collect();
+
+    let mut lcg_state = lcg_seed;
+    let mut next_u = || -> f64 {
+        lcg_state = lcg_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = ((lcg_state >> 32) as u32) as f64 / (u32::MAX as f64);
+        2.0 * u - 1.0
+    };
+    let dim_scale: Vec<f64> = (0..n_dim)
+        .map(|i| (0.6 * seed[i].abs().max(anchor[i].abs())).max(0.5))
+        .collect();
+    let mut candidates: Vec<Vec<f64>> = (0..k)
+        .map(|_| -> Vec<f64> {
+            (0..n_dim)
+                .map(|i| anchor[i] + alpha * dim_scale[i] * rel_grad[i] * next_u())
+                .collect()
+        })
+        .filter(|p: &Vec<f64>| passes_cancellation_filter(p, config))
+        .collect();
+    if nudge_seed {
+        if passes_cancellation_filter(seed, config) {
+            candidates.push(seed.to_vec());
+        }
+        let nudged: Vec<f64> = (0..n_dim)
+            .map(|i| seed[i] + 0.1 * dim_scale[i] * next_u())
+            .collect();
+        if passes_cancellation_filter(&nudged, config) {
+            candidates.push(nudged);
+        }
+    }
+    candidates
+}
+
+/// Run L-BFGS-B from every candidate in parallel and offer each result to `best`.
+fn polish_in_parallel(
+    objective: &SarimaxObjective,
+    candidates: Vec<Vec<f64>>,
+    bounds: &Bounds,
+    budget: u64,
+    label: &str,
+    best: &mut Best,
+    total_work: &mut u64,
+) {
+    if candidates.is_empty() || budget == 0 || crate::batch::guard_rayon_fork().is_err() {
+        return;
+    }
+    for result in par_lbfgsb(objective, candidates, bounds, budget) {
+        match result {
+            Ok((p, c, n, conv)) => {
+                *total_work += n;
+                try_update_best(best, p, c, conv, label);
+            }
+            Err(error) => *total_work += error.work,
         }
     }
 }
@@ -503,42 +480,31 @@ pub(super) fn fit_lbfgsb_single(
 ///      point of basin hopping.
 ///
 ///   2. **Weight perturbation magnitude per dimension by the seed gradient.**
-///      Directions with large |∂L/∂θ_i| carry most of the loss-landscape
-///      information and are most likely to harbor distinct basins. We perturb
-///      those dimensions more aggressively, while keeping near-zero-gradient
-///      dimensions close to the anchor.
+///      See [`hop_candidates`].
 ///
 /// Algorithm:
 ///   1. Run L-BFGS-B from seed → converged anchor θ★ with cost c★.
-///   2. Compute ∇L at the seed (via existing analytical score).
-///   3. Generate K perturbations: θ_k = θ★ + α · |∇L|_norm ⊙ scale ⊙ ξ_k
-///      where ξ ~ LCG U[-1, 1] and scale_i = max(0.5, 0.4·|θ★_i|).
-///   4. Run K perturbed L-BFGS-Bs in parallel via Rayon.
-///   5. Return solution with lowest cost across {θ★, θ_1, …, θ_K}.
+///   2. Generate K gradient-weighted perturbations around θ★ (plus the seed
+///      and a nudged seed).
+///   3. Run them in parallel via Rayon.
+///   4. Return the solution with lowest cost across {θ★, θ_1, …, θ_K}.
 ///
 /// Wall-time cost: ~2× single-start (1× baseline + 1× parallel for K runs).
-/// For rustima — which is already 5–20× faster than statsmodels per fit — the
-/// net is still substantially faster *and* more robust against multi-modality.
 pub(super) fn fit_lbfgsb_adaptive_restart(
     objective: &SarimaxObjective,
     unconstrained_start: Vec<f64>,
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-) -> LbfgsbMethodOutcome {
+) -> MethodOutcome {
     let bounds = compute_bounds(config);
-    let n_dim = unconstrained_start.len();
     let k = n_restarts.max(3);
-
     let baseline_budget = (maxiter / 2).max(1);
     let mut total_work = 0_u64;
 
     // 1. Baseline from seed — run to convergence. The result is our anchor for
-    //    basin hopping: perturbations explore around the LOCAL OPTIMUM, not the
-    //    seed, because uniform exploration around the seed lands in the same
-    //    basin (it's the same gravitational well). Hopping from the converged
-    //    point gives a real chance to escape into neighboring basins.
-    let mut best: Option<(Vec<f64>, f64, bool, String)> = match fit_lbfgsb_single(
+    //    basin hopping (or the seed itself if the baseline failed).
+    let mut best: Best = match fit_lbfgsb_single(
         objective,
         unconstrained_start.clone(),
         config,
@@ -553,111 +519,34 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
             None
         }
     };
-    // Anchor for perturbation = converged baseline (or seed if baseline failed).
     let anchor: Vec<f64> = best
         .as_ref()
         .map(|(p, _, _, _)| p.clone())
         .unwrap_or_else(|| unconstrained_start.clone());
-    let _ = n_dim; // referenced again below
 
-    // 2. Gradient at the SEED (information content per dimension). Even though
-    //    we perturb around the anchor (converged point), the seed gradient
-    //    tells us which dimensions carry signal in the loss landscape — those
-    //    are the dimensions worth exploring aggressively to find new basins.
-    let grad = match objective.analytical_gradient_negloglike(&unconstrained_start) {
-        Ok(g) if g.len() == n_dim => g,
-        _ => vec![1.0; n_dim], // fall back to uniform perturbation
-    };
+    // 2. Hop around the anchor, weighted by the seed gradient.
+    let perturbations = hop_candidates(
+        objective,
+        &unconstrained_start,
+        &anchor,
+        config,
+        1.0,
+        0x9E37_79B9_7F4A_7C15,
+        k,
+        true,
+    );
 
-    // 3. Per-dim relative magnitudes ∈ [0, 1], floored so no dim is fully frozen
-    let max_abs = grad
-        .iter()
-        .map(|g| g.abs())
-        .fold(0.0_f64, f64::max)
-        .max(1e-12);
-    let rel_grad: Vec<f64> = grad.iter().map(|g| (g.abs() / max_abs).max(0.1)).collect();
-
-    // 4. Generate K perturbations via deterministic LCG (no extra deps, reproducible).
-    //    Per-dim perturbation scale = alpha · max(0.5, 0.4 · |start_i|) · rel_grad_i
-    //    The max() ensures unconstrained AR/MA params (small magnitudes ~1) still
-    //    get meaningful perturbations, while exog coeffs (large magnitudes) get
-    //    proportionally scaled exploration to escape distant basins of attraction.
-    let alpha = 1.0_f64;
-    let mut lcg_state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut next_u = || -> f64 {
-        lcg_state = lcg_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u = ((lcg_state >> 32) as u32) as f64 / (u32::MAX as f64);
-        2.0 * u - 1.0
-    };
-    // Per-dim perturbation scale = max(seed magnitude, anchor magnitude).
-    // This captures the full range a parameter naturally takes — for exog
-    // coefficients the seed often differs from the anchor by orders of magnitude
-    // (good sign the optimizer drifted far). Using max(|seed|, |anchor|) ensures
-    // perturbations are big enough to span that gap.
-    let dim_scale: Vec<f64> = (0..n_dim)
-        .map(|i| (0.6 * unconstrained_start[i].abs().max(anchor[i].abs())).max(0.5))
-        .collect();
-    let mut perturbations: Vec<Vec<f64>> = (0..k)
-        .map(|_| -> Vec<f64> {
-            (0..n_dim)
-                .map(|i| anchor[i] + alpha * dim_scale[i] * rel_grad[i] * next_u())
-                .collect()
-        })
-        .filter(|p: &Vec<f64>| passes_cancellation_filter(p, config))
-        .collect();
-    // Always include the SEED itself as a candidate — it lives in a potentially
-    // different basin than the anchor (the optimizer drifted from seed to anchor,
-    // so the two are by construction in different attractor regions if the loss
-    // landscape is multi-modal). Re-running L-BFGS-B from the seed often re-finds
-    // the anchor, but with a large basin gap, may find a new local optimum.
-    if passes_cancellation_filter(&unconstrained_start, config) {
-        perturbations.push(unconstrained_start.clone());
-    }
-    // Also include a "seed + small noise" candidate — covers cases where the
-    // seed itself is on a saddle that L-BFGS-B walks off in a specific direction;
-    // a small kick may push us into a better basin.
-    let nudged: Vec<f64> = (0..n_dim)
-        .map(|i| unconstrained_start[i] + 0.1 * dim_scale[i] * next_u())
-        .collect();
-    if passes_cancellation_filter(&nudged, config) {
-        perturbations.push(nudged);
-    }
-
-    // 5. Run K L-BFGS-Bs in parallel via Rayon
+    // 3. Run them in parallel with the remaining budget split evenly.
     let per_restart_budget = maxiter.saturating_sub(total_work) / perturbations.len().max(1) as u64;
-    if !perturbations.is_empty()
-        && per_restart_budget > 0
-        && crate::batch::guard_rayon_fork().is_ok()
-    {
-        let endog_shared = &objective.endog;
-        let config_shared = &objective.config;
-        let exog_shared = &objective.exog;
-        let bounds_shared = &bounds;
-        let results: Vec<_> = perturbations
-            .into_par_iter()
-            .map(|start| {
-                let obj = SarimaxObjective {
-                    endog: endog_shared.clone(),
-                    config: config_shared.clone(),
-                    exog: exog_shared.clone(),
-                    cache: RefCell::new(None),
-                    ss_cache: RefCell::new(None),
-                };
-                run_lbfgsb(&obj, start, bounds_shared.clone(), per_restart_budget)
-            })
-            .collect();
-        for result in results {
-            match result {
-                Ok((p, c, n, conv)) => {
-                    total_work += n;
-                    try_update_best(&mut best, p, c, conv, "lbfgsb-adaptive");
-                }
-                Err(error) => total_work += error.work,
-            }
-        }
-    }
+    polish_in_parallel(
+        objective,
+        perturbations,
+        &bounds,
+        per_restart_budget,
+        "lbfgsb-adaptive",
+        &mut best,
+        &mut total_work,
+    );
 
     match best {
         Some((p, c, conv, name)) => Ok((p, c, total_work, conv, name)),
@@ -675,30 +564,23 @@ pub(super) fn fit_lbfgsb_adaptive_restart(
 
 /// Hybrid: multi-start followed by gradient-informed adaptive polish.
 ///
-/// Combines the diversity advantage of `fit_lbfgsb_multi` (zero-start, MA grid,
-/// LCG perturbations of the seed — explores many basins) with the basin-hopping
-/// advantage of `fit_lbfgsb_adaptive_restart` (perturb around the *converged*
-/// best, gradient-weighted — escapes the best-so-far basin into neighboring ones).
+/// Combines the diversity of [`multistart`] (zero-start, MA grid, LCG
+/// perturbations of the seed — explores many basins) with the basin hopping of
+/// [`fit_lbfgsb_adaptive_restart`] (perturb around the *converged* best,
+/// gradient-weighted — escapes the best-so-far basin into neighboring ones).
 ///
-/// Pipeline:
-///   1. `fit_lbfgsb_multi` → best-so-far θ★_multi  (diverse exploration)
-///   2. Generate K gradient-informed perturbations around θ★_multi
-///   3. Run K L-BFGS-Bs in parallel via Rayon
-///   4. Return solution with lowest cost across {θ★_multi, θ_1, …, θ_K}
-///
-/// Wall-time: ~1.5× multi-start (multi + parallel K polish). Still 3-5× faster
-/// than statsmodels for SARIMAX while strictly dominating either method alone
-/// in solution quality.
+/// Wall-time: ~1.5× multi-start (multi + parallel K polish).
 pub(super) fn fit_lbfgsb_hybrid(
     objective: &SarimaxObjective,
     unconstrained_start: &[f64],
     config: &SarimaxConfig,
     maxiter: u64,
     n_restarts: usize,
-) -> LbfgsbMethodOutcome {
+) -> MethodOutcome {
     // Stage 1: standard multi-start
     let multi_budget = (maxiter / 2).max(1);
-    let (multi_p, multi_c, multi_iter, multi_conv, orig_name) = fit_lbfgsb_multi(
+    let (multi_p, multi_c, multi_iter, multi_conv, orig_name) = multistart(
+        Method::LbfgsbMulti,
         objective,
         unconstrained_start,
         config,
@@ -706,45 +588,23 @@ pub(super) fn fit_lbfgsb_hybrid(
         n_restarts,
     )?;
     let mut total_work = multi_iter;
-
-    let n_dim = unconstrained_start.len();
     let k = n_restarts.max(3);
     let bounds = compute_bounds(config);
 
-    // Stage 2: gradient-informed adaptive hop anchored on multi-start best
-    let grad = match objective.analytical_gradient_negloglike(unconstrained_start) {
-        Ok(g) if g.len() == n_dim => g,
-        _ => vec![1.0; n_dim],
-    };
-    let max_abs = grad
-        .iter()
-        .map(|g| g.abs())
-        .fold(0.0_f64, f64::max)
-        .max(1e-12);
-    let rel_grad: Vec<f64> = grad.iter().map(|g| (g.abs() / max_abs).max(0.1)).collect();
+    // Stage 2: hop around the multi-start best. alpha is larger than for
+    // adaptive-alone because multi already supplied a strong seed.
+    let perturbations = hop_candidates(
+        objective,
+        unconstrained_start,
+        &multi_p,
+        config,
+        1.5,
+        0xA7F3_5B2E_1290_C84B,
+        k,
+        false,
+    );
 
-    let mut lcg_state: u64 = 0xA7F3_5B2E_1290_C84B;
-    let mut next_u = || -> f64 {
-        lcg_state = lcg_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u = ((lcg_state >> 32) as u32) as f64 / (u32::MAX as f64);
-        2.0 * u - 1.0
-    };
-    let dim_scale: Vec<f64> = (0..n_dim)
-        .map(|i| (0.6 * unconstrained_start[i].abs().max(multi_p[i].abs())).max(0.5))
-        .collect();
-    let alpha = 1.5_f64; // larger than adaptive-alone — multi already gave us a strong seed
-    let perturbations: Vec<Vec<f64>> = (0..k)
-        .map(|_| -> Vec<f64> {
-            (0..n_dim)
-                .map(|i| multi_p[i] + alpha * dim_scale[i] * rel_grad[i] * next_u())
-                .collect()
-        })
-        .filter(|p: &Vec<f64>| passes_cancellation_filter(p, config))
-        .collect();
-
-    let mut best: Option<(Vec<f64>, f64, bool, String)> = Some((
+    let mut best: Best = Some((
         multi_p,
         multi_c,
         multi_conv,
@@ -757,34 +617,15 @@ pub(super) fn fit_lbfgsb_hybrid(
     ));
 
     let polish_budget = maxiter.saturating_sub(total_work) / perturbations.len().max(1) as u64;
-    if !perturbations.is_empty() && polish_budget > 0 && crate::batch::guard_rayon_fork().is_ok() {
-        let endog_shared = &objective.endog;
-        let config_shared = &objective.config;
-        let exog_shared = &objective.exog;
-        let bounds_shared = &bounds;
-        let results: Vec<_> = perturbations
-            .into_par_iter()
-            .map(|start| {
-                let obj = SarimaxObjective {
-                    endog: endog_shared.clone(),
-                    config: config_shared.clone(),
-                    exog: exog_shared.clone(),
-                    cache: RefCell::new(None),
-                    ss_cache: RefCell::new(None),
-                };
-                run_lbfgsb(&obj, start, bounds_shared.clone(), polish_budget)
-            })
-            .collect();
-        for result in results {
-            match result {
-                Ok((p, c, n, conv)) => {
-                    total_work += n;
-                    try_update_best(&mut best, p, c, conv, "lbfgsb-hybrid");
-                }
-                Err(error) => total_work += error.work,
-            }
-        }
-    }
+    polish_in_parallel(
+        objective,
+        perturbations,
+        &bounds,
+        polish_budget,
+        "lbfgsb-hybrid",
+        &mut best,
+        &mut total_work,
+    );
 
     match best {
         Some((p, c, conv, name)) => Ok((p, c, total_work, conv, name)),

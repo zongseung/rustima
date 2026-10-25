@@ -1,12 +1,9 @@
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rustima_core::{batch, optimizer, params::SarimaxParams, types::SarimaxConfig};
+use rustima_core::{batch, optimizer, types::SarimaxConfig};
 
-use crate::inputs::{
-    build_config, parse_and_validate_batch_forecast_exog, parse_trend, prepare_batch_request,
-    validate_alpha, validate_order, validate_single_inputs, validate_steps, ModelFlags,
-};
+use crate::inputs::{exog_cols, parse_batch_request, parse_cols_list, parse_config, ModelFlags};
 use crate::outputs::{fit_result_to_pydict, forecast_to_pydict, to_pyerr};
 
 /// Compute log-likelihood for multiple time series in parallel (Rayon).
@@ -31,7 +28,7 @@ pub(super) fn sarimax_batch_loglike<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyList>> {
-    let (series, exog_vecs, config) = prepare_batch_request(
+    let (series, exog_vecs, config) = parse_batch_request(
         &series_list,
         order,
         seasonal,
@@ -44,13 +41,11 @@ pub(super) fn sarimax_batch_loglike<'py>(
         },
         trend,
     )?;
-
     let params_flat = params.as_slice()?.to_vec();
-    let sarimax_params = SarimaxParams::from_flat(&params_flat, &config).map_err(to_pyerr)?;
 
     // Release GIL for Rayon parallel computation
     let results =
-        py.detach(|| batch::batch_loglike(&series, &config, &sarimax_params, exog_vecs.as_deref()));
+        py.detach(|| batch::batch_loglike(&series, &config, &params_flat, exog_vecs.as_deref()));
 
     let mut py_results: Vec<Py<PyDict>> = Vec::with_capacity(results.len());
     for r in results {
@@ -93,10 +88,8 @@ pub(super) fn sarimax_batch_fit<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyList>> {
-    if let Some(method) = method.filter(|name| name.starts_with("basin-")) {
-        optimizer::validate_method(method).map_err(to_pyerr)?;
-    }
-    let (series, exog_vecs, config) = prepare_batch_request(
+    method.map(optimizer::validate_method).transpose().map_err(to_pyerr)?;
+    let (series, exog_vecs, config) = parse_batch_request(
         &series_list,
         order,
         seasonal,
@@ -166,9 +159,7 @@ pub(super) fn sarimax_grid_search<'py>(
     trend: Option<&str>,
     simple_differencing: bool,
 ) -> PyResult<Py<PyList>> {
-    if let Some(method) = method.filter(|name| name.starts_with("basin-")) {
-        optimizer::validate_method(method).map_err(to_pyerr)?;
-    }
+    method.map(optimizer::validate_method).transpose().map_err(to_pyerr)?;
     if order_list.len() != seasonal_list.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "order_list length ({}) must match seasonal_list length ({})",
@@ -178,29 +169,20 @@ pub(super) fn sarimax_grid_search<'py>(
     }
 
     let endog = y.as_slice()?;
-    let (exog_cols, n_exog) = validate_single_inputs(endog, exog.as_ref())?;
-
-    let trend_val = parse_trend(trend)?;
-
-    // Validate each combination and build configs
-    let mut configs: Vec<SarimaxConfig> = Vec::with_capacity(order_list.len());
-    for (order, seasonal) in order_list.iter().zip(seasonal_list.iter()) {
-        let (p, d, q) = *order;
-        let (pp, dd, qq, s) = *seasonal;
-        validate_order(p, d, q, pp, dd, qq, s, n_exog)?;
-        configs.push(build_config(
-            *order,
-            *seasonal,
-            n_exog,
-            &ModelFlags {
-                enforce_stationarity,
-                enforce_invertibility,
-                concentrate_scale,
-                simple_differencing,
-            },
-            trend_val,
-        ));
-    }
+    let exog_cols = exog_cols(endog.len(), exog.as_ref())?;
+    let n_exog = exog_cols.as_ref().map_or(0, Vec::len);
+    let flags = ModelFlags {
+        enforce_stationarity,
+        enforce_invertibility,
+        concentrate_scale,
+        simple_differencing,
+    };
+    // Each candidate is validated by the core when it is bound, so a bad order is one error entry.
+    let configs = order_list
+        .iter()
+        .zip(&seasonal_list)
+        .map(|(o, s)| parse_config(*o, *s, n_exog, &flags, trend))
+        .collect::<PyResult<Vec<SarimaxConfig>>>()?;
 
     // Release GIL for Rayon parallel computation
     let endog_owned = endog.to_vec();
@@ -272,10 +254,10 @@ pub(super) fn sarimax_batch_forecast<'py>(
             params_list.len()
         )));
     }
-    validate_steps(steps)?;
-    validate_alpha(alpha)?;
-
-    let (series, exog_vecs, config) = prepare_batch_request(
+    // Call-level arguments: reject once instead of once per series.
+    rustima_core::validation::validate_alpha(alpha).map_err(to_pyerr)?;
+    rustima_core::validation::validate_steps(steps).map_err(to_pyerr)?;
+    let (series, exog_vecs, config) = parse_batch_request(
         &series_list,
         order,
         seasonal,
@@ -288,12 +270,8 @@ pub(super) fn sarimax_batch_forecast<'py>(
         },
         trend,
     )?;
-    let future_exog_vecs = parse_and_validate_batch_forecast_exog(
-        &exog_forecast_list,
-        series_list.len(),
-        config.n_exog,
-        steps,
-    )?;
+    let future_exog_vecs =
+        parse_cols_list(&exog_forecast_list, series_list.len(), "exog_forecast_list")?;
 
     let params_vecs: Vec<Vec<f64>> = params_list
         .iter()

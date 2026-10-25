@@ -2,11 +2,10 @@ use extendr_api::prelude::*;
 use extendr_api::Result;
 use rustima_core::{
     auto::{self, Criterion, SearchOptions},
-    batch, forecast, optimizer,
-    params::SarimaxParams,
-    pipeline,
+    batch,
+    model::SarimaxModel,
+    optimizer,
     types::{FitResult, SarimaxConfig, SarimaxOrder, Trend},
-    validation,
 };
 
 fn error(e: impl std::fmt::Display) -> Error {
@@ -59,9 +58,10 @@ fn config(spec: &List, n_exog: usize) -> Result<SarimaxConfig> {
     })
 }
 
-fn fit_list(f: FitResult) -> List {
+fn fit_list(f: FitResult, c: &SarimaxConfig) -> List {
     list!(
         params = f.params,
+        param_names = c.param_names(),
         loglike = f.loglike,
         scale = f.scale,
         aic = f.aic,
@@ -73,10 +73,6 @@ fn fit_list(f: FitResult) -> List {
         method = f.method,
         warnings = f.warnings
     )
-}
-
-fn check_params(params: &[f64], c: &SarimaxConfig) -> Result<SarimaxParams> {
-    SarimaxParams::from_flat(params, c).map_err(error)
 }
 
 fn pool(n: i32) -> Result<rayon::ThreadPool> {
@@ -112,34 +108,24 @@ fn engine_fit(
     }
     let x = columns(xreg)?;
     let c = config(&spec, x.as_ref().map_or(0, Vec::len))?;
-    validation::validate_request(&y, &c, x.as_deref()).map_err(error)?;
     let start = match start {
         Nullable::Null => None,
         Nullable::NotNull(v) => Some(v),
     };
-    if let Some(start) = &start {
-        validation::validate_finite(start, "start_params").map_err(error)?;
-    }
-    optimizer::fit(
-        &y,
-        &c,
-        start.as_deref(),
-        Some(optimizer),
-        Some(maxiter as u64),
-        x.as_deref(),
-    )
-    .map(fit_list)
-    .map_err(error)
+    SarimaxModel::new(y, x, c.clone())
+        .map_err(error)?
+        .fit(start.as_deref(), Some(optimizer), Some(maxiter as u64))
+        .map(|f| fit_list(f, &c))
+        .map_err(error)
 }
 
 #[extendr]
 fn engine_loglike(y: Vec<f64>, spec: List, xreg: List, params: Vec<f64>) -> Result<f64> {
     let x = columns(xreg)?;
     let c = config(&spec, x.as_ref().map_or(0, Vec::len))?;
-    validation::validate_request(&y, &c, x.as_deref()).map_err(error)?;
-    let p = check_params(&params, &c)?;
-    pipeline::kalman_eval(&y, &p, &c, x.as_deref())
-        .map(|v| v.loglike)
+    SarimaxModel::new(y, x, c)
+        .map_err(error)?
+        .loglike(&params)
         .map_err(error)
 }
 
@@ -154,14 +140,12 @@ fn engine_forecast(
     future: List,
 ) -> Result<List> {
     let steps = usize::try_from(n_ahead).map_err(error)?;
-    validation::validate_steps(steps).map_err(error)?;
-    validation::validate_alpha(alpha).map_err(error)?;
     let x = columns(xreg)?;
     let c = config(&spec, x.as_ref().map_or(0, Vec::len))?;
-    validation::validate_request(&y, &c, x.as_deref()).map_err(error)?;
-    let p = check_params(&params, &c)?;
     let future = columns(future)?;
-    let f = forecast::forecast_pipeline(&y, &c, &p, steps, alpha, x.as_deref(), future.as_deref())
+    let f = SarimaxModel::new(y, x, c)
+        .map_err(error)?
+        .forecast(&params, steps, alpha, future.as_deref())
         .map_err(error)?;
     Ok(list!(
         pred = f.mean,
@@ -202,13 +186,11 @@ fn engine_batch(
         })
         .collect::<Result<_>>()?;
     let c = config(&spec, x.first().map_or(0, Vec::len))?;
-    for (y, x) in y.iter().zip(&x) {
-        validation::validate_request(y, &c, Some(x)).map_err(error)?;
-    }
+    // Each series is validated by the core when bound, so one bad series is one error entry.
     let results = pool(nthreads)?
         .install(|| batch::batch_fit(&y, &c, Some(optimizer), Some(maxiter as u64), Some(&x)));
     Ok(List::from_values(results.into_iter().map(|r| match r {
-        Ok(f) => fit_list(f),
+        Ok(f) => fit_list(f, &c),
         Err(e) => list!(error = e.to_string()),
     })))
 }
@@ -229,11 +211,7 @@ fn engine_grid(
     let x = columns(xreg)?;
     let configs: Vec<_> = specs
         .values()
-        .map(|v| {
-            let c = config(&List::try_from(v)?, x.as_ref().map_or(0, Vec::len))?;
-            validation::validate_request(&y, &c, x.as_deref()).map_err(error)?;
-            Ok(c)
-        })
+        .map(|v| config(&List::try_from(v)?, x.as_ref().map_or(0, Vec::len)))
         .collect::<Result<_>>()?;
     let results = pool(nthreads)?.install(|| {
         batch::grid_search_fit(
@@ -244,8 +222,8 @@ fn engine_grid(
             x.as_deref(),
         )
     });
-    Ok(List::from_values(results.into_iter().map(|r| match r {
-        Ok(f) => fit_list(f),
+    Ok(List::from_values(results.into_iter().zip(&configs).map(|(r, c)| match r {
+        Ok(f) => fit_list(f, c),
         Err(e) => list!(error = e.to_string()),
     })))
 }
@@ -312,8 +290,10 @@ fn engine_auto(
         .map_err(error)?;
     let best = result.best.map(|best| {
         let o = best.order;
+        let mut c = config.clone();
+        c.order = o.clone();
         list!(
-            fit = fit_list(best.fit),
+            fit = fit_list(best.fit, &c),
             order = vec![o.p as i32, o.d as i32, o.q as i32],
             seasonal = vec![o.pp as i32, o.dd as i32, o.qq as i32, o.s as i32]
         )

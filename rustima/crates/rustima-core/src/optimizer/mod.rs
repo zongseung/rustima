@@ -11,12 +11,9 @@ use nalgebra::DMatrix;
 
 use crate::css;
 use crate::error::{Result, SarimaxError};
-use crate::initialization::KalmanInit;
-use crate::kalman::kalman_loglike;
+use crate::model::Prepared;
 use crate::params::SarimaxParams;
-use crate::pipeline;
 use crate::start_params::compute_start_params;
-use crate::state_space::StateSpace;
 use crate::types::{FitResult, SarimaxConfig};
 
 #[cfg(test)]
@@ -30,19 +27,19 @@ mod tests;
 mod transforms;
 mod trust_region;
 
-use lbfgsb::parse_method;
+use lbfgsb::Method;
 use multistart::{
-    compute_n_restarts, fit_bfgs_single, fit_lbfgs_multi, fit_lbfgsb_adaptive_restart,
-    fit_lbfgsb_hybrid, fit_lbfgsb_multi, fit_lbfgsb_single,
+    compute_n_restarts, fit_bfgs_single, fit_lbfgsb_adaptive_restart, fit_lbfgsb_hybrid,
+    fit_lbfgsb_single, multistart,
 };
 use objective::{CssObjective, SarimaxObjective};
 use runners::{compute_bounds, run_lbfgsb, run_nelder_mead};
-use transforms::expected_param_len;
+
 pub use transforms::{transform_params, untransform_params};
 use trust_region::{fit_profile_trust_region, fit_trust_region_single};
 
 pub fn validate_method(method: &str) -> Result<()> {
-    parse_method(method).map(|_| ())
+    Method::parse(method).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -59,15 +56,6 @@ pub fn validate_method(method: &str) -> Result<()> {
 /// curvature accumulation.
 const DIAG_PRECOND_SCALE: f64 = 0.1;
 
-/// Penalty variance used when the Kalman innovation variance F_t is non-
-/// positive at observation t (a sign the model is at a near-non-stationary
-/// boundary, e.g. AR roots ≈ unit circle). Instead of aborting, we contribute
-/// `log F_safe` to the log-likelihood for that observation, yielding a smooth,
-/// finite-but-bad cost the optimizer can back away from. Value ≈ 1e10 means
-/// each offending observation costs ~23 log-likelihood units — small enough
-/// to be meaningful, large enough to dominate any real innovation magnitude.
-pub(crate) const KF_FT_FALLBACK_VARIANCE: f64 = 1.0e10;
-
 // ---------------------------------------------------------------------------
 // Fast paths (pure AR, maxiter=0)
 // ---------------------------------------------------------------------------
@@ -75,13 +63,12 @@ pub(crate) const KF_FT_FALLBACK_VARIANCE: f64 = 1.0e10;
 /// Try pure AR fast path: for high-order non-seasonal pure AR models with
 /// concentrated scale, Burg AR coefficients are asymptotically MLE-equivalent.
 fn try_ar_fast_path(
-    endog: &[f64],
-    config: &SarimaxConfig,
+    data: &Prepared,
     constrained_start: &[f64],
-    exog: Option<&[Vec<f64>]>,
-    method: &str,
+    method: Method,
     start_params_provided: bool,
 ) -> Result<Option<FitResult>> {
+    let config = data.config();
     let is_pure_ar_fast = config.order.p >= 3
         && config.order.q == 0
         && config.order.qq == 0
@@ -91,14 +78,11 @@ fn try_ar_fast_path(
         && config.concentrate_scale
         && !start_params_provided;
 
-    if !is_pure_ar_fast || method != "lbfgsb" {
+    if !is_pure_ar_fast || method != Method::Lbfgsb {
         return Ok(None);
     }
 
-    let test_params = SarimaxParams::from_flat(constrained_start, config)?;
-    let test_ss = StateSpace::new(config, &test_params, endog, exog)?;
-    let test_init = KalmanInit::from_config_default(&test_ss, config);
-    let test_output = kalman_loglike(endog, &test_ss, &test_init, config.concentrate_scale)?;
+    let test_output = data.loglike(&SarimaxParams::from_flat(constrained_start, config)?)?;
 
     if test_output.loglike.is_finite() {
         let n_params = SarimaxParams::n_estimated_params(config);
@@ -107,7 +91,7 @@ fn try_ar_fast_path(
                 params: constrained_start.to_vec(),
                 loglike: test_output.loglike,
                 scale: test_output.scale,
-                n_obs: endog.len(),
+                n_obs: data.endog().len(),
                 n_params,
                 n_iter: 0,
                 converged: true,
@@ -129,24 +113,20 @@ fn try_ar_fast_path(
 /// optimize), `false` when the caller explicitly requested `maxiter=0` but there
 /// are free parameters remaining.
 fn build_zero_iter_result(
-    endog: &[f64],
-    config: &SarimaxConfig,
+    data: &Prepared,
     constrained_start: &[f64],
-    exog: Option<&[Vec<f64>]>,
     method: &str,
 ) -> Result<FitResult> {
-    let sp = SarimaxParams::from_flat(constrained_start, config)?;
-    let ss = StateSpace::new(config, &sp, endog, exog)?;
-    let init = KalmanInit::from_config_default(&ss, config);
-    let output = kalman_loglike(endog, &ss, &init, config.concentrate_scale)?;
+    let config = data.config();
+    let output = data.loglike(&SarimaxParams::from_flat(constrained_start, config)?)?;
     let n_params = SarimaxParams::n_estimated_params(config);
-    let k_free = expected_param_len(config);
+    let k_free = config.n_params();
     let converged = k_free == 0;
     Ok(FitResult {
         params: constrained_start.to_vec(),
         loglike: output.loglike,
         scale: output.scale,
-        n_obs: endog.len(),
+        n_obs: data.endog().len(),
         n_params,
         n_iter: 0,
         converged,
@@ -160,14 +140,13 @@ fn build_zero_iter_result(
 
 /// Build final FitResult from optimized unconstrained parameters.
 fn build_fit_result(
-    endog: &[f64],
-    config: &SarimaxConfig,
+    data: &Prepared,
     best_unconstrained: &[f64],
     n_iter: u64,
     converged: bool,
     used_method: String,
-    exog: Option<&[Vec<f64>]>,
 ) -> Result<FitResult> {
+    let config = data.config();
     let final_constrained = transform_params(best_unconstrained, config)?;
     let final_params = SarimaxParams::from_flat(&final_constrained, config)?;
 
@@ -182,16 +161,14 @@ fn build_fit_result(
         ));
     }
 
-    let ss = StateSpace::new(config, &final_params, endog, exog)?;
-    let init = KalmanInit::from_config_default(&ss, config);
-    let output = kalman_loglike(endog, &ss, &init, config.concentrate_scale)?;
+    let output = data.loglike(&final_params)?;
     let n_params = SarimaxParams::n_estimated_params(config);
 
     Ok(FitResult {
         params: final_constrained,
         loglike: output.loglike,
         scale: output.scale,
-        n_obs: endog.len(),
+        n_obs: data.endog().len(),
         n_params,
         n_iter,
         converged,
@@ -217,7 +194,7 @@ fn validate_and_get_start_params(
     start_params: Option<&[f64]>,
     exog: Option<&[Vec<f64>]>,
 ) -> Result<Vec<f64>> {
-    let min_obs = expected_param_len(config).max(config.order.k_states().saturating_add(1));
+    let min_obs = config.n_params().max(config.order.k_states().saturating_add(1));
     if endog.len() <= min_obs {
         return Err(SarimaxError::DataError(format!(
             "Not enough observations: n={} <= minimum required {} for model order",
@@ -228,7 +205,7 @@ fn validate_and_get_start_params(
 
     match start_params {
         Some(sp) => {
-            let expected_len = expected_param_len(config);
+            let expected_len = config.n_params();
             if sp.len() != expected_len {
                 return Err(SarimaxError::ParamLengthMismatch {
                     expected: expected_len,
@@ -246,13 +223,8 @@ fn validate_and_get_start_params(
 // ---------------------------------------------------------------------------
 
 /// Evaluate KF log-likelihood at constrained parameters. Returns NEG_INFINITY on error.
-fn eval_kf_loglike_constrained(
-    endog: &[f64],
-    config: &SarimaxConfig,
-    constrained: &[f64],
-    exog: Option<&[Vec<f64>]>,
-) -> f64 {
-    match pipeline::kalman_eval_constrained(endog, constrained, config, exog) {
+fn eval_kf_loglike_constrained(data: &Prepared, constrained: &[f64]) -> f64 {
+    match SarimaxParams::from_flat(constrained, data.config()).and_then(|p| data.loglike(&p)) {
         Ok(out) if out.loglike.is_finite() => out.loglike,
         _ => f64::NEG_INFINITY,
     }
@@ -271,8 +243,7 @@ fn run_sd_warm_start(
     let mut sd_config = config.clone();
     sd_config.simple_differencing = true;
 
-    let (sd_endog, sd_exog_owned) = pipeline::prepare_endog(endog, &sd_config, exog).ok()?;
-    let sd_exog: Option<&[Vec<f64>]> = sd_exog_owned.as_deref();
+    let sd_data = Prepared::new(endog, exog, &sd_config).ok()?;
 
     // Get CSS-based start params for SD model
     let mut sd_start = validate_and_get_start_params(endog, &sd_config, None, exog).ok()?;
@@ -281,8 +252,8 @@ fn run_sd_warm_start(
     let n_arma = sd_config.order.p + sd_config.order.q + sd_config.order.pp + sd_config.order.qq;
     if n_arma >= 1 {
         if let Some(css_p) = run_css_optimization(endog, &sd_config, &sd_start, 200, exog) {
-            let css_ll = eval_kf_loglike_constrained(&sd_endog, &sd_config, &css_p, sd_exog);
-            let orig_ll = eval_kf_loglike_constrained(&sd_endog, &sd_config, &sd_start, sd_exog);
+            let css_ll = eval_kf_loglike_constrained(&sd_data, &css_p);
+            let orig_ll = eval_kf_loglike_constrained(&sd_data, &sd_start);
             if css_ll > orig_ll {
                 sd_start = css_p;
             }
@@ -292,9 +263,7 @@ fn run_sd_warm_start(
     // Quick L-BFGS-B on SD model (200 iterations — enough for warm-start)
     let sd_unc = untransform_params(&sd_start, &sd_config).ok()?;
     let sd_obj = SarimaxObjective {
-        endog: sd_endog.to_vec(),
-        config: sd_config.clone(),
-        exog: sd_exog.map(|e| e.to_vec()),
+        data: sd_data,
         cache: RefCell::new(None),
         ss_cache: RefCell::new(None),
     };
@@ -530,26 +499,13 @@ fn run_nm_css(
     maxiter: u64,
     exog: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
-    let n = unconstrained_start.len();
     let obj = CssObjective {
         endog: endog.to_vec(),
         config: config.clone(),
         exog: exog.map(|e| e.to_vec()),
     };
 
-    // Build simplex: initial point + n perturbations
-    let mut simplex = vec![unconstrained_start.to_vec()];
-    for i in 0..n {
-        let mut vertex = unconstrained_start.to_vec();
-        let delta = if vertex[i].abs() > 0.1 {
-            vertex[i] * 0.05
-        } else {
-            0.025
-        };
-        vertex[i] += delta;
-        simplex.push(vertex);
-    }
-
+    let simplex = runners::simplex(unconstrained_start, 0.1, 0.025);
     let (best_unconstrained, _, _, _) = runners::run_simplex(obj, simplex, maxiter, 1e-4).ok()?;
     transform_params(&best_unconstrained, config).ok()
 }
@@ -564,9 +520,10 @@ fn run_nm_css(
 /// * `endog` — Observed time series
 /// * `config` — Model configuration (order, stationarity enforcement, etc.)
 /// * `start_params` — Optional initial parameter values (constrained space)
-/// * `method` — "lbfgsb" (default), "lbfgsb-multi", "trust-region",
-///   "profile-trust-region", "lbfgs", or "nelder-mead". L-BFGS-B uses Basin;
-///   the "basin-" prefix remains accepted for source compatibility.
+/// * `method` — "lbfgsb" (default), "lbfgsb-multi", "lbfgsb-adaptive",
+///   "lbfgsb-hybrid", "lbfgsb-strict", "lbfgs", "bfgs", "trust-region",
+///   "profile-trust-region", or "nelder-mead" ("nm"). The `lbfgsb*` names
+///   also accept a "basin-" prefix for source compatibility.
 /// * `maxiter` — Maximum optimizer work units (default: 500)
 /// * `exog` — Optional exogenous variables, column-major: exog[j][t]
 pub fn fit(
@@ -578,17 +535,12 @@ pub fn fit(
     exog: Option<&[Vec<f64>]>,
 ) -> Result<FitResult> {
     let maxiter = maxiter.unwrap_or(500);
-    let requested_method = method.unwrap_or("lbfgsb");
-    let method = parse_method(requested_method)?;
-    let method_label = if method.starts_with("lbfgsb") {
-        format!("basin-{}", method.replace("_single", "-strict"))
-    } else {
-        method.to_string()
-    };
+    let method = Method::parse(method.unwrap_or("lbfgsb"))?;
+    let method_label = method.label();
 
     // (b) start_params length: must match expected free param count if provided.
     if let Some(sp) = start_params {
-        let expected = expected_param_len(config);
+        let expected = config.n_params();
         if sp.len() != expected {
             return Err(SarimaxError::InvalidInput(format!(
                 "start_params length mismatch: expected {}, got {}",
@@ -598,55 +550,27 @@ pub fn fit(
         }
     }
 
-    // simple_differencing: pre-difference the data so the Kalman filter sees
-    // a stationary ARMA-only series. n_obs = eff_endog.len() for AIC/BIC.
-    let (eff_endog, eff_exog_owned) = pipeline::prepare_endog(endog, config, exog)?;
-    let eff_endog: &[f64] = &eff_endog;
-    let eff_exog: Option<&[Vec<f64>]> = if config.simple_differencing {
-        eff_exog_owned.as_deref()
-    } else {
-        exog
-    };
+    // simple_differencing: the Kalman filter sees the differenced series;
+    // n_obs = data.endog().len() for AIC/BIC.
+    let data = Prepared::new(endog, exog, config)?;
 
     // 0. Zero-parameter fast path: models like (0,d,0) with concentrate_scale
     //    have no free parameters to optimize. Return closed-form result directly
     //    to avoid entering L-BFGS-B FFI with n=0.
-    {
-        let k_params = config.trend.k_trend()
-            + config.n_exog
-            + config.order.p
-            + config.order.q
-            + config.order.pp
-            + config.order.qq
-            + if config.concentrate_scale { 0 } else { 1 };
-        if k_params == 0 {
-            return build_zero_iter_result(eff_endog, config, &[], eff_exog, &method_label);
-        }
+    if config.n_params() == 0 {
+        return build_zero_iter_result(&data, &[], method_label);
     }
 
     // 1. Validate + compute start params (always use original endog: CSS init
     //    applies differencing internally via apply_differencing)
     let mut constrained_start = validate_and_get_start_params(endog, config, start_params, exog)?;
 
-    // 2. Fast paths (AR-only, maxiter=0) — use eff_endog
-    if let Some(r) = try_ar_fast_path(
-        eff_endog,
-        config,
-        &constrained_start,
-        eff_exog,
-        method,
-        start_params.is_some(),
-    )? {
+    // 2. Fast paths (AR-only, maxiter=0)
+    if let Some(r) = try_ar_fast_path(&data, &constrained_start, method, start_params.is_some())? {
         return Ok(r);
     }
     if maxiter == 0 {
-        return build_zero_iter_result(
-            eff_endog,
-            config,
-            &constrained_start,
-            eff_exog,
-            &method_label,
-        );
+        return build_zero_iter_result(&data, &constrained_start, method_label);
     }
 
     // 2.5. CSS-ML 2-stage pre-optimization (R-style):
@@ -664,7 +588,7 @@ pub fn fit(
     // start_params) by capping per-step radius. CSS pre-opt would discard that
     // seed and start the trust-region search from a basin determined by CSS,
     // defeating the purpose of preventing first-iteration drift.
-    let skip_css_preopt = method == "trust-region";
+    let skip_css_preopt = method == Method::TrustRegion;
     if start_params.is_none() && !skip_css_preopt {
         let n_arma = config.order.p + config.order.q + config.order.pp + config.order.qq;
         let is_seasonal = config.order.s >= 2 && (config.order.pp > 0 || config.order.qq > 0);
@@ -674,11 +598,8 @@ pub fn fit(
             if let Some(css_params) =
                 run_css_optimization(endog, config, &constrained_start, 300, exog)
             {
-                // KF evaluation uses eff_endog (already differenced)
-                let css_kf_ll =
-                    eval_kf_loglike_constrained(eff_endog, config, &css_params, eff_exog);
-                let orig_kf_ll =
-                    eval_kf_loglike_constrained(eff_endog, config, &constrained_start, eff_exog);
+                let css_kf_ll = eval_kf_loglike_constrained(&data, &css_params);
+                let orig_kf_ll = eval_kf_loglike_constrained(&data, &constrained_start);
                 let threshold = if is_seasonal { 0.0 } else { 2.0 };
                 if css_kf_ll > orig_kf_ll + threshold {
                     constrained_start = css_params;
@@ -696,9 +617,8 @@ pub fn fit(
         let k_states = config.order.k_states();
         if k_states >= 40 {
             if let Some(sd_params) = run_sd_warm_start(endog, config, exog) {
-                let sd_ll = eval_kf_loglike_constrained(eff_endog, config, &sd_params, eff_exog);
-                let orig_ll =
-                    eval_kf_loglike_constrained(eff_endog, config, &constrained_start, eff_exog);
+                let sd_ll = eval_kf_loglike_constrained(&data, &sd_params);
+                let orig_ll = eval_kf_loglike_constrained(&data, &constrained_start);
                 if sd_ll > orig_ll + 1.0 {
                     constrained_start = sd_params;
                 }
@@ -706,75 +626,61 @@ pub fn fit(
         }
     }
 
-    // 3. Transform to unconstrained space + build objective (with eff_endog)
+    // 3. Transform to unconstrained space + build objective
     let unconstrained_start = untransform_params(&constrained_start, config)?;
     let objective = SarimaxObjective {
-        endog: eff_endog.to_vec(),
-        config: config.clone(),
-        exog: eff_exog.map(|e| e.to_vec()),
+        data,
         cache: RefCell::new(None),
         ss_cache: RefCell::new(None),
     };
     let n_restarts = compute_n_restarts(unconstrained_start.len(), config);
 
-    // 4. Match method → dispatch to extracted function
+    // 4. Dispatch on the parsed method
     let (best_unconstrained, _best_cost, n_iter, converged, used_method) = match method {
-        "nelder-mead" | "nm" => {
+        Method::NelderMead => {
             let (p, c, n, conv) = run_nelder_mead(objective.clone(), unconstrained_start, maxiter)
                 .map_err(SarimaxError::OptimizationFailed)?;
             (p, c, n, conv, "nelder-mead".to_string())
         }
-        "lbfgsb-strict" | "lbfgsb_single" => {
+        Method::LbfgsbStrict => {
             let bounds = compute_bounds(config);
-            let (p, c, n, conv) = run_lbfgsb(&objective, unconstrained_start, bounds, maxiter)
-                .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?;
+            let (p, c, n, conv) = run_lbfgsb(&objective, unconstrained_start, bounds, maxiter)?;
             (p, c, n, conv, "lbfgsb-strict".to_string())
         }
-        "lbfgsb" => fit_lbfgsb_single(&objective, unconstrained_start, config, maxiter)
-            .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
-        "lbfgsb-multi" => fit_lbfgsb_multi(
-            &objective,
-            &unconstrained_start,
-            config,
-            maxiter,
-            n_restarts,
-        )
-        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
-        "lbfgsb-adaptive" => fit_lbfgsb_adaptive_restart(
-            &objective,
-            unconstrained_start,
-            config,
-            maxiter,
-            n_restarts,
-        )
-        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
-        "lbfgsb-hybrid" => fit_lbfgsb_hybrid(
-            &objective,
-            &unconstrained_start,
-            config,
-            maxiter,
-            n_restarts,
-        )
-        .map_err(|e| SarimaxError::OptimizationFailed(e.to_string()))?,
-        "lbfgs" => fit_lbfgs_multi(
+        Method::Lbfgsb => fit_lbfgsb_single(&objective, unconstrained_start, config, maxiter)?,
+        Method::LbfgsbMulti | Method::Lbfgs => multistart(
+            method,
             &objective,
             &unconstrained_start,
             config,
             maxiter,
             n_restarts,
         )?,
-        "bfgs" => fit_bfgs_single(&objective, unconstrained_start, config, maxiter)?,
-        "trust-region" => {
+        Method::LbfgsbAdaptive => fit_lbfgsb_adaptive_restart(
+            &objective,
+            unconstrained_start,
+            config,
+            maxiter,
+            n_restarts,
+        )?,
+        Method::LbfgsbHybrid => fit_lbfgsb_hybrid(
+            &objective,
+            &unconstrained_start,
+            config,
+            maxiter,
+            n_restarts,
+        )?,
+        Method::Bfgs => fit_bfgs_single(&objective, unconstrained_start, maxiter)?,
+        Method::TrustRegion => {
             fit_trust_region_single(&objective, unconstrained_start, config, maxiter)?
         }
-        "profile-trust-region" => fit_profile_trust_region(
+        Method::ProfileTrustRegion => fit_profile_trust_region(
             &objective,
             unconstrained_start,
             config,
             maxiter,
             start_params.is_some(),
         )?,
-        _ => unreachable!("validated optimization method"),
     };
     let used_method = if used_method.starts_with("lbfgsb") {
         format!("basin-{used_method}")
@@ -782,14 +688,6 @@ pub fn fit(
         used_method
     };
 
-    // 5. Build result (n_obs = eff_endog.len() for correct AIC/BIC)
-    build_fit_result(
-        eff_endog,
-        config,
-        &best_unconstrained,
-        n_iter,
-        converged,
-        used_method,
-        eff_exog,
-    )
+    // 5. Build result (n_obs = differenced length for correct AIC/BIC)
+    build_fit_result(&objective.data, &best_unconstrained, n_iter, converged, used_method)
 }

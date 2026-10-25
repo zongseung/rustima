@@ -1,7 +1,6 @@
 //! Trust-region BFGS optimizers and exog coordinate polishing.
 
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 use crate::error::SarimaxError;
 use crate::types::SarimaxConfig;
@@ -12,8 +11,6 @@ use super::runners::{
     finite_diff_grad_negll, finite_diff_grad_profile_negll, run_nelder_mead, MethodOutcome,
     RunOutcome,
 };
-use super::multistart::lcg_perturbed_starts;
-
 /// Maximum number of trust-region radius resets before terminating. After the
 /// radius shrinks below `tol_radius` from accumulated rejected steps, the
 /// solver is given up to this many fresh restarts at the initial radius — a
@@ -25,24 +22,6 @@ const TRUST_REGION_MAX_RESETS: u32 = 2;
 /// halving in trust-region. Helps escape stagnation faster when the quadratic
 /// model is locally inaccurate.
 const TRUST_REGION_REJECT_THRESHOLD: u32 = 5;
-
-/// Number of starting points used by the Profiled Kalman-GLS Trust-Region
-/// (PTR) method.
-///
-/// Set to 1 (single-start) by default: empirically, on the 2019 hourly
-/// power-demand SARIMAX(3,0,3)(1,1,1)[24] benchmark, M=2 multi-start
-/// converged to the same local optimum as the warm-up anchor while paying a
-/// 16% wall-time cost. Just as importantly, M>1 introduces a nested
-/// `par_iter` inside `fit_profile_trust_region`, and that nesting interacts
-/// poorly with the outer Rayon pool used by `auto_arima`'s parallel stepwise
-/// (`sarimax_grid_search`) — both layers share the global pool, which
-/// fragments work-stealing and limits achievable parallelism on multi-core
-/// machines. Setting M=1 eliminates the nested layer entirely.
-///
-/// Users who need robustness against multimodal likelihoods on a particular
-/// dataset can opt into M>1 by recompiling, or by calling the lower-level
-/// fit function with explicit `start_params`.
-const PROFILE_MULTI_START_COUNT: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Trust-region BFGS (custom implementation)
@@ -583,14 +562,14 @@ fn sample_std(values: &[f64]) -> Option<f64> {
 }
 
 fn exog_beta_scale(objective: &SarimaxObjective, exog_idx: usize) -> f64 {
-    let Some(exog) = objective.exog.as_ref() else {
+    let Some(exog) = objective.data.exog() else {
         return 1.0;
     };
     let Some(col) = exog.get(exog_idx) else {
         return 1.0;
     };
 
-    let y_scale = sample_std(&objective.endog).unwrap_or(1.0).max(1.0);
+    let y_scale = sample_std(objective.data.endog()).unwrap_or(1.0).max(1.0);
     let x_scale = sample_std(col).unwrap_or(1.0).max(1.0e-12);
     (y_scale / x_scale).max(1.0)
 }
@@ -780,13 +759,13 @@ pub(super) fn fit_profile_trust_region(
         return fit_trust_region_single(objective, unconstrained_start, config, maxiter);
     }
 
-    let exog = objective.exog.clone().ok_or_else(|| {
+    let exog = objective.data.exog().map(<[_]>::to_vec).ok_or_else(|| {
         SarimaxError::InvalidInput(
             "profile-trust-region requires exog columns when n_exog > 0".to_string(),
         )
     })?;
     let profiled_objective = ProfiledSarimaxObjective {
-        endog: objective.endog.clone(),
+        endog: objective.data.endog().to_vec(),
         config: config.clone(),
         exog,
     };
@@ -806,53 +785,15 @@ pub(super) fn fit_profile_trust_region(
     let profiled_anchor = remove_exog_block(&start, config);
     let profile_budget = maxiter.saturating_sub(warm_iter).max(1);
 
-    // Run the profile-trust-region optimizer. Multi-start is only used when
-    // PROFILE_MULTI_START_COUNT > 1; the M=1 default path runs a single fit
-    // directly (no `par_iter`, no nested-Rayon contention) so that the outer
-    // `sarimax_grid_search` parallelism in auto_arima can use the full
-    // thread pool without sharing it with an inner par_iter layer.
-    let (profiled_p, c, n, conv) = if PROFILE_MULTI_START_COUNT <= 1 {
-        // Single-start fast path: avoids constructing a starts vector and
-        // bypasses Rayon entirely for the inner fit.
-        run_profile_trust_region_bfgs(
-            profiled_objective.clone(),
-            profiled_anchor,
-            profile_budget,
-        )
-        .map_err(SarimaxError::OptimizationFailed)?
-    } else {
-        // Multi-start path (opt-in via the constant): launch M PTR fits in
-        // parallel from distinct starting points and keep the best.
-        let mut starts: Vec<Vec<f64>> = Vec::with_capacity(PROFILE_MULTI_START_COUNT);
-        starts.push(profiled_anchor.clone());
-        let extra = PROFILE_MULTI_START_COUNT - 1;
-        let perturbed = lcg_perturbed_starts(&profiled_anchor, extra, &profile_budget);
-        for s in perturbed {
-            starts.push(s);
-        }
-        // Sequential fallback in a fork()ed child — the inherited rayon pool
-        // would deadlock (DIAGNOSIS_V9 C1/C2).
-        let results: Vec<_> = if crate::batch::guard_rayon_fork().is_ok() {
-            starts
-                .into_par_iter()
-                .map(|s| run_profile_trust_region_bfgs(profiled_objective.clone(), s, profile_budget))
-                .collect()
-        } else {
-            starts
-                .into_iter()
-                .map(|s| run_profile_trust_region_bfgs(profiled_objective.clone(), s, profile_budget))
-                .collect()
-        };
-        results
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| {
-                SarimaxError::OptimizationFailed(
-                    "all multi-start profile-trust-region fits failed".to_string(),
-                )
-            })?
-    };
+    // Single start on purpose: on the 2019 hourly power-demand SARIMAX(3,0,3)(1,1,1)[24]
+    // benchmark a second start re-found the warm-up anchor at +16% wall time, and a
+    // nested par_iter here would fragment the pool that auto_arima's grid search uses.
+    let (profiled_p, c, n, conv) = run_profile_trust_region_bfgs(
+        profiled_objective.clone(),
+        profiled_anchor,
+        profile_budget,
+    )
+    .map_err(SarimaxError::OptimizationFailed)?;
 
     let eval = profiled_objective
         .eval_profiled(&profiled_p)

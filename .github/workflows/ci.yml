@@ -44,7 +44,7 @@ jobs:
         working-directory: rustima
         run: |
           uv venv .venv
-          uv pip install maturin numpy polars pytest statsmodels scipy pandas
+          uv pip install maturin numpy polars pytest
       - name: Build and install wheel
         working-directory: rustima
         run: |
@@ -52,7 +52,7 @@ jobs:
           uv pip install --force-reinstall --no-deps /tmp/wheels/rustima-*.whl
       - name: Test installed wheel
         working-directory: rustima
-        run: .venv/bin/python -m pytest packages/python/tests -o pythonpath= -m "not nightly" --tb=short
+        run: .venv/bin/python -m pytest packages/python/tests -o pythonpath= --tb=short
 
   r-check:
     name: R source package (${{ matrix.os }})
