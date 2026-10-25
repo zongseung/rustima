@@ -11,96 +11,100 @@ env:
 
 jobs:
   rust-test:
-    name: Rust Tests (${{ matrix.backend }}, ${{ matrix.rust }})
+    name: Shared core (Rust ${{ matrix.rust }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, msrv]
-        backend: [legacy, basin]
-        include:
-          - backend: legacy
-            features: ""
-          - backend: basin
-            features: basin
+        rust: [stable, "1.87.0"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Read minimum supported Rust version
-        if: matrix.rust == 'msrv'
-        id: msrv
-        working-directory: rustima
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import tomllib
-
-          with open("Cargo.toml", "rb") as manifest:
-              version = tomllib.load(manifest)["package"]["rust-version"]
-          print(f"version={version}")
-          PY
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ steps.msrv.outputs.version || matrix.rust }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rustima/target
-          key: ${{ runner.os }}-${{ steps.msrv.outputs.version || matrix.rust }}-${{ matrix.backend }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run Rust tests
+          workspaces: rustima
+      - name: Test core and benchmark targets
         working-directory: rustima
-        run: cargo test --locked --all-targets --no-default-features --features "${{ matrix.features }}"
+        run: cargo test -p rustima-core --all-targets --locked
 
   python-test:
-    name: Python Tests (${{ matrix.backend }})
+    name: Python installed wheel
     runs-on: ubuntu-latest
     needs: rust-test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - backend: legacy
-            features: ""
-            expect_basin: "0"
-          - backend: basin
-            features: basin
-            expect_basin: "1"
-    env:
-      RUSTIMA_TEST_BASIN: ${{ matrix.expect_basin }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      - name: Create venv and install deps
+      - uses: astral-sh/setup-uv@v4
+      - name: Install build and test dependencies
         working-directory: rustima
         run: |
           uv venv .venv
-          uv pip install numpy pytest statsmodels scipy pandas
-
-      - name: Build wheel and install
+          uv pip install maturin numpy polars pytest
+      - name: Build and install wheel
         working-directory: rustima
         run: |
-          uv pip install maturin
-          CARGO_TARGET_DIR=target_wheel uv run --no-sync maturin build --locked --release --features "${{ matrix.features }}" --out /tmp/wheels
-          uv pip install --force-reinstall /tmp/wheels/rustima-*.whl
-
-      - name: Run Python tests (excluding nightly)
+          .venv/bin/maturin build --locked --release --manifest-path packages/python/Cargo.toml --out /tmp/wheels
+          uv pip install --force-reinstall --no-deps /tmp/wheels/rustima-*.whl
+      - name: Test installed wheel
         working-directory: rustima
-        # Exercise the installed wheel instead of a source-tree extension.
-        run: .venv/bin/python -m pytest python_tests/ -o pythonpath= -m "not nightly" -v --tb=short
+        run: .venv/bin/python -m pytest packages/python/tests -o pythonpath= --tb=short
+
+  r-check:
+    name: R source package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      R_KEEP_PKG_SOURCE: yes
+      RAYON_NUM_THREADS: 2
+    defaults:
+      run:
+        shell: bash
+        working-directory: rustima
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-pandoc@v2
+      - name: Install shell checker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y devscripts
+      - name: Install shell checker (macOS)
+        if: runner.os == 'macOS'
+        run: brew install checkbashisms
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'Windows' && 'x86_64-pc-windows-gnu' || '' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build standalone source package
+        run: python tools/build_r_package.py
+      - name: Check source package
+        run: |
+          mkdir -p dist/r/check
+          R CMD check --no-manual --as-cran --output=dist/r/check dist/r/rustima_*.tar.gz
+          python - <<'PY'
+          from pathlib import Path
+          log = Path("dist/r/check/rustima.Rcheck/00check.log").read_text()
+          status = next(line for line in log.splitlines() if line.startswith("Status:"))
+          assert "ERROR" not in status and "WARNING" not in status, status
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r-check-${{ matrix.os }}
+          path: |
+            rustima/dist/r/*.tar.gz
+            rustima/dist/r/check/**/*.log
+            rustima/dist/r/check/**/*.Rout*

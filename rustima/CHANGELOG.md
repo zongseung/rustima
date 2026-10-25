@@ -5,11 +5,35 @@ Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
 ## Unreleased
 
-- Add an optional Basin 3.0.0 L-BFGS-B backend, selected with
-  `method="basin-lbfgsb"` and its strict, multi-start, adaptive, and hybrid
-  variants. Include numerical comparisons, convergence checks, and benchmarks.
-- Correct the minimum Rust version to 1.87, matching the existing nalgebra
-  dependency, and test both optimizer backends on that toolchain.
+- Fix `simple_differencing=True` with exogenous regressors: forecasts now difference
+  the future exog like the fitted regressors (they were used in levels), and OPG
+  standard errors run on the differenced series with the matching `n_eff`. A new
+  core test pins `simple_differencing=True` on (y, x) to the plain model on (Δy, Δx).
+- One set of validation rules, in Rust (`SarimaxModel::new`). Python now follows the
+  core bounds (`d <= 3`, `D <= 2` where the state space allows it, trend `"tc"`
+  accepted, no minimum series length at construction); parameter names come from the
+  core. R: `coef()` returns a named vector; one invalid series in `sarimax_batch()` /
+  `sarimax_grid_search()` is one error entry instead of failing the whole call;
+  `sarimax_batch_fit`/`sarimax_grid_search` (Python) reject unknown method names up front.
+- Optimizer method names are parsed once into an enum; `maxiter=0` results for
+  `"nm"` are labelled `"nelder-mead"` like every other Nelder-Mead result.
+- Loglike and analytical score now share one steady-state detector, so the gradient
+  freezes the Kalman recursion at the same step as the likelihood (gradients move by
+  ≤1e-9 relative; the likelihood is bit-identical).
+- Replace argmin's L-BFGS, BFGS and Nelder-Mead solvers with Basin 3.0, including
+  CSS initialization and fallback refinement. Preserve API names, BFGS diagonal
+  preconditioning and simplex construction, and remove argmin dependencies.
+
+## 0.4.0rc1 — distribution preparation
+
+- Separate the shared `rustima-core`, Python package and R package directories.
+- Use Basin 3.0 for all L-BFGS-B fits, retaining existing method names and Basin
+  aliases. Remove the vendored C solver, FFI wrappers and C build script.
+- Add an R 0.1.0 preview through extendr: fixed-order fits, likelihoods, S3
+  forecasts, independent batch fits and explicit candidate grid search.
+- Bundle locked Rust dependencies and the shared core in an offline-installable
+  R source archive. Separate Python `py-v*` and R `r-v*` release workflows.
+- Keep Python's existing high-level API and numerical reference suite.
 
 ## 0.3.0 — 2026-07-25
 

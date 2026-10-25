@@ -1,0 +1,19 @@
+[package]
+name = "rustima-r"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "rustima"
+crate-type = ["staticlib"]
+
+[workspace]
+exclude = ["engine"]
+
+[dependencies]
+extendr-api = "=0.9.0"
+rustima-core = { path = "../../../../../crates/rustima-core" }
+rayon = "1.10"

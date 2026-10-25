@@ -1,0 +1,22 @@
+[package]
+name = "rustima-python"
+version = "0.4.0-rc.1"
+edition = "2021"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+description = "Python bindings for the shared Rust SARIMAX engine"
+repository = "https://github.com/zongseung/rustima"
+publish = false
+
+[lib]
+name = "rustima"
+crate-type = ["cdylib"]
+
+[features]
+# Keep existing source-build commands working; Basin is now always enabled.
+basin = []
+
+[dependencies]
+rustima-core = { path = "../../crates/rustima-core" }
+pyo3 = "0.28"
+numpy = "0.28"

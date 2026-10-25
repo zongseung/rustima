@@ -1,0 +1,19 @@
+TARGET = x86_64-pc-windows-gnu
+TARGET_DIR = $(CURDIR)/rust/target
+STATLIB = $(TARGET_DIR)/$(TARGET)/release/librustima.a
+PKG_LIBS = $(STATLIB) -lws2_32 -ladvapi32 -luserenv -lbcrypt -lntdll
+
+all: $(SHLIB) rust_clean
+
+$(SHLIB): $(STATLIB)
+
+.PHONY: $(STATLIB)
+$(STATLIB):
+	export PATH="$(PATH):$(HOME)/.cargo/bin"; CARGO_HOME="$(CURDIR)/.cargo" cargo build --manifest-path=rust/Cargo.toml --target-dir="$(TARGET_DIR)" --target=$(TARGET) --lib --release --locked --offline -j 1
+
+clean:
+	rm -rf $(SHLIB) $(OBJECTS) rust/target .cargo vendor
+
+.PHONY: rust_clean
+rust_clean: $(SHLIB)
+	rm -rf rust/target .cargo vendor
