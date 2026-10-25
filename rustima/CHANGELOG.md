@@ -5,6 +5,11 @@ Versions follow `0.MINOR.PATCH`, where breaking changes bump MINOR.
 
 ## Unreleased
 
+## 0.4.0 — stable release
+
+- Publish the shared Rust core and Python bindings as the stable 0.4.0 release.
+- Promote the validated 0.4.0rc2 code without changing computational behavior.
+
 ## 0.4.0rc2 — shared core and validation fixes
 
 - Fix `simple_differencing=True` with exogenous regressors: forecasts now difference
