@@ -1,8 +1,9 @@
 # CRAN submission: rustima 0.1.1
 
 Final validation completed on 2026-10-26. The maintainer confirmed
-`zongseung <new9279@gachon.ac.kr>`. This records preparation and checks;
-the package has not been submitted to CRAN.
+`zongseung <new9279@gachon.ac.kr>`. A CRAN submission request was sent on
+2026-10-26. The maintainer completed email confirmation and reported CRAN's
+message that the package was forwarded to the CRAN submission team.
 
 ## Checked submission archive
 
@@ -62,23 +63,31 @@ Case-insensitive name checks on 2026-10-26 found no `rustima` match in CRAN's
 (3,818 package links) and devel (3,874 package links). Evidence is saved in
 `dist/r/cran/name-checks.json`.
 
-## Submit
+## Submission status, 2026-10-26
 
-1. Confirm that no other submission of this package is already pending.
-2. Verify the checked file from `dist/r/cran/final/` with
-   `shasum -a 256 -c SHA256SUMS`.
-3. Upload that exact archive using the
-   [CRAN submission form](https://cran.r-project.org/submit.html), with
-   `packages/r/rustima/cran-comments.md` as the optional comment.
-4. The designated maintainer must accept CRAN's confirmation email. Wait for
-   CRAN's response before submitting another revision.
+- [PR #12](https://github.com/zongseung/rustima/pull/12) was merged into `main`
+  as `9e8407a2a526bc4e5eda7daa0dd2376652ffb015`.
+  [The main-branch CI passed](https://github.com/zongseung/rustima/actions/runs/40278546172).
+- The same checked archive was uploaded to the separate Win-builder R-devel
+  service at 06:14 UTC. Its upload response reports the correct filename and
+  5,197,682 bytes. Results will be sent to `new9279@gachon.ac.kr`.
+- CRAN accepted the submission request at 06:24 UTC and displayed Step 3
+  (Confirmation). Its response says a confirmation email was sent to the
+  maintainer. The maintainer then completed the email confirmation and supplied
+  the success message: the package was uploaded to the CRAN submission team.
+  The archive appeared in CRAN's incoming/pretest queue; downloading it confirmed
+  that its SHA-256 exactly matches the checked candidate above.
+  **Submission is confirmed and awaiting CRAN review; publication is pending.**
 
-The separate Win-builder service has not been used; Windows release and
-R-devel checks were run in GitHub Actions. No CRAN upload or merge into
-`main` has been performed. Changes are on `release/r-cran-0.1.1`.
-Documentation and artifact-retention edits after the tested commit do not
-change the package source included in the checked archive. If package code or
-metadata changes, build a new candidate and repeat the checks.
+Receipts, the exact submitted comments, and a combined status record are saved
+under `dist/r/cran/final/submissions/`. `cran-confirmation-response.html` records
+CRAN's response; `win-builder-r-devel-response.html` records its upload receipt.
+Do not upload another CRAN revision while this request is being processed.
+Await the CRAN team's response.
+
+All commits included in PR #12 use the existing author identity; no Codex or
+OpenAI co-author trailer was added. Documentation and artifact-retention edits
+after the tested commit do not change the package source in the checked archive.
 
 References: [CRAN policy](https://cran.r-project.org/web/packages/policies.html),
 [submission checklist](https://cran.r-project.org/web/packages/submission_checklist.html),

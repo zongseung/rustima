@@ -1,7 +1,8 @@
-# rustima R preview
+# rustima R package
 
 Direct extendr binding to `crates/rustima-core`. No Python runtime is required.
-This preview has not been submitted to CRAN.
+Version 0.1.1 was submitted to CRAN on 2026-10-26 and is awaiting review.
+Until publication, install the source archive as described below.
 
 From the `rustima/` workspace directory:
 

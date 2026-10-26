@@ -21,7 +21,8 @@ these environments on 2026-10-26:
 Every check completed with 0 errors, 0 warnings, and 1 NOTE. Both R test
 scripts, compiled Rust checks, and PDF and HTML manuals passed.
 The source archive was built using R 4.6.1. Windows R-devel was tested
-in GitHub Actions rather than the separate Win-builder service.
+in GitHub Actions. The same archive was additionally uploaded to Win-builder
+R-devel on 2026-10-26; its result email is pending.
 
 Check results:
 https://github.com/zongseung/rustima/actions/runs/40275011224
