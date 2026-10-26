@@ -62,9 +62,11 @@ and used `--no-manual`; it is not a check of this final archive.
 
 ## Checks before upload
 
-- The R release workflow checks R-release on Linux, macOS, and Windows, plus
-  R-devel on Linux. It includes the PDF manual and rejects errors and warnings.
-  Its artifacts include the source archive and check logs.
+- The R release workflow builds one archive with R-release and checks that
+  exact archive on R-release on Linux, macOS, and Windows, plus R-devel on
+  Linux and Windows. Every check verifies its SHA-256 before installation.
+  It includes the PDF manual and rejects errors and warnings. Its artifacts
+  include the source archive and check logs.
 - Run this workflow on the final source revision, then review every NOTE.
   Results from an earlier revision do not validate the final archive.
 - Check the exact final archive on
@@ -76,10 +78,10 @@ and used `--no-manual`; it is not a check of this final archive.
 - Confirm that no submission of this package is already pending. First-submission
   notes and the size needed to bundle Rust sources should be explained in the
   submission comments. Do not suppress checks to remove notes.
-- Recheck name availability in CRAN (including the archive) and Bioconductor.
-  The local preparation found no match in CRAN's current package index and the
-  `rustima` archive URL returned HTTP 404. Bioconductor's package-index download
-  returned HTTP 403 and its complete name check remains pending.
+- Name availability was checked without regard to case on 2026-10-26:
+  CRAN's 25,559 current packages and 28,325 archive names, plus Bioconductor's
+  release (3,818 package links) and devel (3,874 package links), have no
+  `rustima` match. Evidence is saved in `dist/r/cran/name-checks.json`.
 
 GitHub Actions can be run from the R source release workflow's **Run workflow**
 button after these changes are committed and pushed. A tag is not needed for
