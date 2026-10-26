@@ -41,7 +41,13 @@ def build(output):
             ["cargo", "metadata", "--locked", "--format-version", "1", "--manifest-path", str(manifest)], text=True))
         inst = stage / "inst"
         inst.mkdir(exist_ok=True)
-        (inst / "COPYRIGHTS").write_text("\n".join(
+        (inst / "COPYRIGHTS").write_text(
+            "Bundled Rust crates: authors and licenses from Cargo metadata.\n"
+            "Original copyright and license notices are included with the sources\n"
+            "in src/rust/vendor.tar.xz and src/rust/engine/LICENSE. Where Cargo\n"
+            "metadata omits authors, refer to those original notices.\n"
+            "Extendr 0.9.0 notices and contributors are in inst/extendr, copied from\n"
+            "https://github.com/extendr/extendr/tree/564d0de80ba6cff3f8c04e3b3e336d1346590ec6\n\n" + "\n".join(
             f"{p['name']} {p['version']}: {p.get('license') or 'see bundled source'}; " + ", ".join(p["authors"])
             for p in metadata["packages"]) + "\n")
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -61,6 +67,10 @@ def build(output):
         names = archive.getnames()
         assert any(n.endswith("/src/rust/engine/src/lib.rs") for n in names)
         assert any(n.endswith("/src/rust/vendor.tar.xz") for n in names)
+        assert "rustima/inst/COPYRIGHTS" in names
+        assert "rustima/inst/extendr/LICENSE" in names
+        assert "rustima/inst/extendr/CONTRIBUTORS.md" in names
+        assert "rustima/cran-comments.md" not in names
         assert not any("lbfgsb_c" in n or "/target/" in n for n in names)
     print(candidates[-1])
     return candidates[-1]

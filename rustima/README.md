@@ -47,3 +47,5 @@ Release candidate tags follow `py-v<VERSION>-rc.<N>` and `r-v<VERSION>-rc.<N>`.
 Python tags trigger wheel/sdist builds; R tags trigger source builds and R checks.
 R tags never invoke the PyPI publication workflow. A CRAN submission remains a
 separate maintainer action after platform checks pass.
+See [CRAN submission preparation](docs/cran-submission.md) for the final checks
+and submission steps.
