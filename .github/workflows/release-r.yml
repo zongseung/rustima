@@ -107,5 +107,6 @@ jobs:
           name: r-source-${{ matrix.os }}-${{ matrix.r }}
           path: |
             rustima/dist/r/check/**/*.log
+            rustima/dist/r/check/**/00install.out
             rustima/dist/r/check/**/*.Rout*
             rustima/dist/r/check/**/*.pdf

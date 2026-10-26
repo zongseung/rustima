@@ -1,100 +1,84 @@
-# CRAN submission preparation: rustima 0.1.1
+# CRAN submission: rustima 0.1.1
 
-This is preparation for the first CRAN submission, not a record of submission
-or acceptance. The existing GitHub R preview is a separate distribution.
-The maintainer confirmed `zongseung <new9279@gachon.ac.kr>` on 2026-10-26.
+Final validation completed on 2026-10-26. The maintainer confirmed
+`zongseung <new9279@gachon.ac.kr>`. This records preparation and checks;
+the package has not been submitted to CRAN.
 
-## Build the submission archive
+## Checked submission archive
 
-Run from the `rustima/` workspace with R >= 4.2, Cargo/rustc >= 1.87,
-Python 3, and the platform's R build tools. The builder needs access to the
-locked Cargo sources; the resulting package installs without network access.
+Use `dist/r/cran/final/rustima_0.1.1.tar.gz` (5,197,682 bytes).
+This is the single archive built with R 4.6.1 and checked in every environment
+below. Earlier archives under `dist/r/cran/` are historical candidates.
 
-```sh
-python3 tools/build_r_package.py --output dist/r/cran
-mkdir -p dist/r/cran/check
-RAYON_NUM_THREADS=2 R CMD check --as-cran \
-  --output=dist/r/cran/check dist/r/cran/rustima_0.1.1.tar.gz
-```
-
-Use a current R release to build the archive and R-devel to check it before
-submission. A working LaTeX installation is required for the complete check;
-`--no-manual` does not verify the PDF manual. Keep the checked archive,
-`00check.log`, `00install.out`, test logs, and PDF together. Record its SHA-256:
-
-```sh
-shasum -a 256 dist/r/cran/rustima_0.1.1.tar.gz
-```
-
-The package compiles its bundled Rust sources with `--locked --offline -j 1`.
-No compiler, Rust crate, or precompiled library is downloaded during installation.
-Rust crate credits are indexed in `inst/COPYRIGHTS`; notices remain in the
-vendored sources. The extendr 0.9.0 crates omit their repository's license files,
-so the upstream license and contributor list are also supplied in `inst/extendr`.
-Their source commit is recorded in the generated `inst/COPYRIGHTS`.
-
-## Local validation, 2026-10-26
-
-The final archive was checked on macOS arm64 with R 4.5.1 and the minimum
-supported Cargo/rustc 1.87.0, using TinyTeX (TeX Live 2026) and HTML Tidy 5.8.0.
-`R CMD check --as-cran` completed with **0 errors, 0 warnings, 1 NOTE**.
-The NOTE reports the maintainer, new submission, and source archive size.
-Offline installation, `auto.R`, `smoke.R`, and the PDF and HTML manuals pass.
-
-The source archive is `dist/r/cran/rustima_0.1.1.tar.gz` (5,199,895 bytes).
-Its SHA-256 is:
+SHA-256:
 
 ```text
-b23d00ef47c975844104fa8257bdaf14021a0c8a1749a942ac92aa95dfbb29d7
+5af9b052597f6d3b797cc8ca61e86ef13b182161fad3a950973b20d403cf5534
 ```
 
-Logs are under `dist/r/cran/check-macos-final/rustima.Rcheck/`; a separate
-manual is saved as `dist/r/cran/rustima-manual.pdf`. The archive was also
-checked for compiled binaries, retained license notices for its 86 vendored
-crates, exclusion of `cran-comments.md`, and agreement with the package sources.
-Configuration self-checks reject old Cargo and old rustc separately and accept
-the declared minimum versions. `actionlint` passes for the release workflow.
+Source commit: `0e9e2342c00649d9c26f283bd35c56939b0f6867`.
+[Successful GitHub Actions run](https://github.com/zongseung/rustima/actions/runs/40275011224).
+The workflow builds one archive and verifies its SHA-256 in each check job.
 
-This local R version is older than the current release. Final current-R,
-R-devel, Linux, Windows, and Win-builder checks are still required. Earlier
-GitHub CI passed on all three operating systems, but predates these changes
-and used `--no-manual`; it is not a check of this final archive.
+## Final check results
 
-## Checks before upload
+All six full `R CMD check --as-cran` runs finished with **0 errors,
+0 warnings, 1 NOTE**. The sole NOTE is the incoming new-submission note.
+Both R test scripts (`auto.R`, `smoke.R`), compiled Rust checks, and PDF
+and HTML manuals pass in every environment.
 
-- The R release workflow builds one archive with R-release and checks that
-  exact archive on R-release on Linux, macOS, and Windows, plus R-devel on
-  Linux and Windows. Every check verifies its SHA-256 before installation.
-  It includes the PDF manual and rejects errors and warnings. Its artifacts
-  include the source archive and check logs.
-- Run this workflow on the final source revision, then review every NOTE.
-  Results from an earlier revision do not validate the final archive.
-- Check the exact final archive on
-  [Win-builder](https://win-builder.r-project.org/) with R-devel. The service
-  sends results to the maintainer; this has not been requested during local
-  preparation.
-- Update `packages/r/rustima/cran-comments.md` with those results. It is kept
-  outside the source archive by `.Rbuildignore`.
-- Confirm that no submission of this package is already pending. First-submission
-  notes and the size needed to bundle Rust sources should be explained in the
-  submission comments. Do not suppress checks to remove notes.
-- Name availability was checked without regard to case on 2026-10-26:
-  CRAN's 25,559 current packages and 28,325 archive names, plus Bioconductor's
-  release (3,818 package links) and devel (3,874 package links), have no
-  `rustima` match. Evidence is saved in `dist/r/cran/name-checks.json`.
+| Environment | R |
+|---|---|
+| Ubuntu 24.04.5, x86_64 | 4.6.1 |
+| Ubuntu 24.04.5, x86_64 | R-devel, 2026-10-24 r90762 |
+| macOS Tahoe 26.6.2, arm64 | 4.6.1 |
+| Windows Server 2022, x86_64 | 4.6.1 UCRT |
+| Windows Server 2022, x86_64 | R-devel, 2026-10-24 r90762 UCRT |
+| Local macOS arm64, minimum Rust toolchain | 4.5.1; Cargo/rustc 1.87.0 |
 
-GitHub Actions can be run from the R source release workflow's **Run workflow**
-button after these changes are committed and pushed. A tag is not needed for
-the check. This workflow does not upload to CRAN.
+Downloaded platform logs and manuals are under
+`dist/r/cran/final/platform-checks/`; local minimum-toolchain logs, including
+`00install.out`, are under `dist/r/cran/final/check-macos-msrv/rustima.Rcheck/`.
+A machine-readable summary is `dist/r/cran/final/check-summary.json`.
 
-## Submit after final checks
+Archive checks confirm the SHA-256, preserved extendr notices, absence of
+compiled binaries, exclusion of `cran-comments.md`, and absence of Codex/OpenAI
+authorship. `actionlint` passes. The source workflow now also retains
+`00install.out` in future runs; that artifact-retention change does not alter
+the checked package sources or archive.
 
-Upload the checked `rustima_0.1.1.tar.gz` using the
-[CRAN submission form](https://cran.r-project.org/submit.html), with the final
-contents of `cran-comments.md` in the optional comment. The designated
-maintainer must accept CRAN's confirmation email. Wait for a response before
-submitting another revision; increase the version if a revised submission is
-needed. Do not describe the package as CRAN-published until acceptance.
+## Packaging and name checks
+
+The builder embeds the shared Rust core and 86 locked Rust crates. Installation
+uses a package-local Cargo home and `--locked --offline -j 1`; no Rust compiler,
+crate, or precompiled library is downloaded. Configuration checks Cargo and
+rustc >= 1.87. Credits are indexed in `inst/COPYRIGHTS`; original licenses remain
+in the vendored sources. Extendr 0.9.0 omits its repository license files from
+its crates, so the matching upstream license and contributor list are also
+supplied in `inst/extendr`, with their source commit recorded in the index.
+
+Case-insensitive name checks on 2026-10-26 found no `rustima` match in CRAN's
+25,559 current packages or 28,325 archive names, or Bioconductor's release
+(3,818 package links) and devel (3,874 package links). Evidence is saved in
+`dist/r/cran/name-checks.json`.
+
+## Submit
+
+1. Confirm that no other submission of this package is already pending.
+2. Verify the checked file from `dist/r/cran/final/` with
+   `shasum -a 256 -c SHA256SUMS`.
+3. Upload that exact archive using the
+   [CRAN submission form](https://cran.r-project.org/submit.html), with
+   `packages/r/rustima/cran-comments.md` as the optional comment.
+4. The designated maintainer must accept CRAN's confirmation email. Wait for
+   CRAN's response before submitting another revision.
+
+The separate Win-builder service has not been used; Windows release and
+R-devel checks were run in GitHub Actions. No CRAN upload or merge into
+`main` has been performed. Changes are on `release/r-cran-0.1.1`.
+Documentation and artifact-retention edits after the tested commit do not
+change the package source included in the checked archive. If package code or
+metadata changes, build a new candidate and repeat the checks.
 
 References: [CRAN policy](https://cran.r-project.org/web/packages/policies.html),
 [submission checklist](https://cran.r-project.org/web/packages/submission_checklist.html),
