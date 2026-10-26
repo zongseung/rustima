@@ -3,10 +3,9 @@ for (tool in c("cargo", "rustc")) {
     if (!nzchar(Sys.which(tool))) stop("Install ", tool, " before installing rustima")
     version <- system2(tool, "--version", stdout = TRUE)
     message(version)
-    if (tool == "rustc") {
-        actual <- strsplit(version, " ", fixed = TRUE)[[1]][2]
-        if (utils::compareVersion(actual, "1.87") < 0L) stop("rustima requires rustc >= 1.87")
-    }
+    actual <- strsplit(version[1L], " ", fixed = TRUE)[[1]][2]
+    if (utils::compareVersion(actual, "1.87") < 0L)
+        stop("rustima requires ", tool, " >= 1.87")
 }
 if (!file.exists("src/rust/vendor.tar.xz"))
     stop("Use tools/build_r_package.py to prepare the self-contained R source package")

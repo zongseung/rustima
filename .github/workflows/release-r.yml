@@ -10,12 +10,45 @@ permissions:
   contents: read
 
 jobs:
+  source:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustima
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build submission archive
+        run: |
+          python tools/build_r_package.py
+          cd dist/r
+          sha256sum rustima_*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r-source-package
+          path: |
+            rustima/dist/r/*.tar.gz
+            rustima/dist/r/SHA256SUMS
+
   source-check:
+    needs: source
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        r: [release]
+        include:
+          - os: ubuntu-latest
+            r: devel
+          - os: windows-latest
+            r: devel
     env:
       RAYON_NUM_THREADS: 2
     defaults:
@@ -25,27 +58,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: r-lib/actions/setup-pandoc@v2
-      - name: Install shell checker (Linux)
+      - name: Install shell and HTML checkers (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y devscripts
-      - name: Install shell checker (macOS)
+          sudo apt-get install --no-install-recommends -y devscripts tidy
+      - name: Install shell and HTML checkers (macOS)
         if: runner.os == 'macOS'
-        run: brew install checkbashisms
+        run: brew install checkbashisms tidy-html5
       - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: ${{ matrix.r }}
+      - uses: r-lib/actions/setup-tinytex@v2
+        env:
+          TINYTEX_INSTALLER: TinyTeX
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'Windows' && 'x86_64-pc-windows-gnu' || '' }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build vendored source package
-        run: python tools/build_r_package.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: r-source-package
+          path: rustima/dist/r
+      - name: Verify submission archive
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          root = Path("dist/r")
+          digest, name = (root / "SHA256SUMS").read_text().split()
+          assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
+          PY
       - name: Check package
         run: |
           mkdir -p dist/r/check
-          R CMD check --no-manual --as-cran --output=dist/r/check dist/r/rustima_*.tar.gz
+          R CMD check --as-cran --output=dist/r/check dist/r/rustima_*.tar.gz
           python - <<'PY'
           from pathlib import Path
           log = Path("dist/r/check/rustima.Rcheck/00check.log").read_text()
@@ -55,8 +104,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: r-source-${{ matrix.os }}
+          name: r-source-${{ matrix.os }}-${{ matrix.r }}
           path: |
-            rustima/dist/r/*.tar.gz
             rustima/dist/r/check/**/*.log
+            rustima/dist/r/check/**/00install.out
             rustima/dist/r/check/**/*.Rout*
+            rustima/dist/r/check/**/*.pdf

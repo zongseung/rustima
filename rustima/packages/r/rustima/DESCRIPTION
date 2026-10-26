@@ -1,16 +1,22 @@
 Package: rustima
-Title: Seasonal ARIMA Models Powered by Rust
+Title: Seasonal ARIMA Models Powered by 'Rust'
 Version: 0.1.1
-Authors@R: person("zongseung", email = "new9279@gachon.ac.kr", role = c("aut", "cre"))
+Authors@R: c(
+    person("zongseung", email = "new9279@gachon.ac.kr", role = c("aut", "cre")),
+    person("Authors of the bundled Rust crates", role = c("ctb", "cph"),
+           comment = "See inst/COPYRIGHTS for authorship and license details"))
 Description: Fits seasonal autoregressive integrated moving average models
-    with optional regression terms using a shared Rust engine. Provides
-    Kalman likelihood evaluation, Basin optimization, forecasting, and
-    independent batch fits and automatic ARIMA order selection without a
-    Python runtime.
+    with optional regression terms using a shared 'Rust' engine. Provides
+    Kalman likelihood evaluation, numerical optimization via 'Basin', forecasting,
+    independent batch fits, and automatic ARIMA order selection without a
+    'Python' runtime.
 License: GPL (>= 3)
+Copyright: See inst/COPYRIGHTS for the bundled Rust crates. Original
+    copyright and license notices are retained in src/rust/vendor.tar.xz
+    and inst/extendr.
 Encoding: UTF-8
 Depends: R (>= 4.2)
 Imports: stats
-SystemRequirements: Cargo, rustc (>= 1.87), xz
+SystemRequirements: Cargo (>= 1.87), rustc (>= 1.87), xz
 URL: https://github.com/zongseung/rustima
 BugReports: https://github.com/zongseung/rustima/issues

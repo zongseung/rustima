@@ -1,7 +1,9 @@
 # rustima 0.1.1 (release candidate)
 
 - Reject extra future regressor columns before differencing.
-- Update the bundled Rust core to 0.4.0-rc.2.
+- Update the bundled Rust core to 0.4.0.
+- Credit bundled Rust crate authors and retain their license notices.
+- Check both Cargo and rustc against the minimum supported version (1.87).
 
 # rustima 0.1.0 (release candidate)
 
